@@ -1,0 +1,287 @@
+"""SSC-TV-L21-PQ: L1 on E, L2,1 on both P = DC and Q = CD^T.
+
+See README.md for the shared ADMM formulation and how this file differs
+from the other SSC-TV variants.
+"""
+
+import warnings
+import numpy as np
+from sklearn.cluster import SpectralClustering
+
+warnings.filterwarnings('ignore', message='.*matmul.*', category=RuntimeWarning)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def soft_threshold(x, tau):
+    return np.sign(x) * np.maximum(np.abs(x) - tau, 0.0)
+
+
+def block_soft_threshold_cols(M, tau):
+    """Proximal operator of tau * ||·||_{2,1} (sum of column L2-norms).
+
+    Each column m_j is shrunk toward zero by the group lasso rule:
+        prox(m_j) = max(0, 1 - tau / ||m_j||_2) * m_j
+    """
+    col_norms = np.linalg.norm(M, axis=0, keepdims=True)          # (1, N)
+    scale = np.maximum(1.0 - tau / np.maximum(col_norms, 1e-12), 0.0)
+    return scale * M
+
+
+def finite_diff_matrix(N):
+    """First-order finite-difference operator D ∈ ℝ^{(N-1)×N}."""
+    D = np.zeros((N - 1, N))
+    idx = np.arange(N - 1)
+    D[idx, idx]     = -1.0
+    D[idx, idx + 1] =  1.0
+    return D
+
+
+# ── ADMM solver ──────────────────────────────────────────────────────────────
+
+def ssc_admm_nuc_tv(
+    Y,
+    lambda_e=1.0,
+    lambda_z=0.1,
+    gamma=0.1,
+    mu=1.0,
+    sigma=1.0,
+    max_iter=50,
+    tol=1e-4,
+):
+    """
+    Sparse Subspace Clustering with anisotropic Total-Variation regularisation.
+
+    Parameters
+    ----------
+    Y        : ndarray (n, N)   data matrix (columns = data points)
+    lambda_e : float            weight on ||E||_1
+    lambda_z : float            weight on reconstruction loss
+    gamma    : float            TV weight  γ(||P||_{2,1} + ||Q||_{2,1})
+    mu       : float            ADMM penalty for the X = C_off constraint
+    sigma    : float            ADMM penalty for the TV auxiliary constraints
+    max_iter : int
+    tol      : float            convergence tolerance (max primal Frobenius residual)
+
+    Returns
+    -------
+    X, C, E : ndarrays
+    """
+    n, N = Y.shape
+
+    # ── Precompute static quantities ──────────────────────────────────────────
+    D = finite_diff_matrix(N)                 # (N-1, N)
+    K = D.T @ D                               # (N, N), symmetric PSD
+    eigs, V = np.linalg.eigh(K)               # eigs ascending, V orthogonal
+
+    # Sylvester denominator: denom[i,j] = μ + σ(λ_i + λ_j)
+    denom = mu + sigma * (eigs[:, None] + eigs[None, :])          # (N, N)
+    A_inv = np.linalg.inv(lambda_z * (Y.T @ Y) + mu * np.eye(N))  # for X-update
+
+    # ── Initialise primal and dual variables ──────────────────────────────────
+    X = np.zeros((N, N))
+    C = np.zeros((N, N))
+    E = np.zeros((n, N))
+    P = np.zeros((N - 1, N))     # DC   auxiliary
+    Q = np.zeros((N, N - 1))     # CD^T auxiliary
+
+    Lambda = np.zeros((N, N))    # dual for X = C_off
+    Pi_P   = np.zeros((N - 1, N))   # dual for DC = P
+    Pi_Q   = np.zeros((N, N - 1))   # dual for CD^T = Q
+
+    for it in range(max_iter):
+        X_prev = X
+
+        # 1. X-update
+        C_off = C - np.diag(np.diag(C))
+        X = A_inv @ (lambda_z * (Y.T @ (Y - E)) + mu * C_off - Lambda)
+
+        # 2. C-update (Sylvester equation via eigendecomposition of K)
+        P_tilde = P - Pi_P / sigma
+        Q_tilde = Q - Pi_Q / sigma
+        RHS_C   = mu * (X + Lambda / mu) + sigma * (D.T @ P_tilde + Q_tilde @ D)
+        C = V @ ((V.T @ RHS_C @ V) / denom) @ V.T
+        np.fill_diagonal(C, 0.0)
+
+        # 3-4. P- and Q-updates: column-wise group soft threshold (L2,1)
+        DC  = D @ C
+        CDt = C @ D.T
+        P = block_soft_threshold_cols(DC  + Pi_P / sigma, gamma / sigma)
+        Q = block_soft_threshold_cols(CDt + Pi_Q / sigma, gamma / sigma)
+
+        # 5. E-update
+        E = soft_threshold(Y - Y @ X, lambda_e / lambda_z)
+
+        # 6. Dual updates
+        C_off = C - np.diag(np.diag(C))
+        Lambda += mu    * (X   - C_off)
+        Pi_P   += sigma * (DC  - P)
+        Pi_Q   += sigma * (CDt - Q)
+
+        # Convergence check
+        primal_res = max(
+            np.linalg.norm(X   - C_off, 'fro'),
+            np.linalg.norm(DC  - P,     'fro'),
+            np.linalg.norm(CDt - Q,     'fro'),
+        )
+        dual_res = mu * np.linalg.norm(X - X_prev, 'fro')
+        if primal_res < tol and dual_res < tol:
+            break
+
+    return X, C, E
+
+
+def ssc_admm_nuc_tv_e21(
+    Y,
+    lambda_e=1.0,
+    lambda_z=0.1,
+    gamma=0.1,
+    mu=1.0,
+    sigma=1.0,
+    max_iter=50,
+    tol=1e-4,
+):
+    """
+    SSC-ADMM with TV on C and L2,1 norm on E (column-group sparsity).
+
+    Objective
+    ---------
+        min   λ_e ||E||_{2,1}  +  (λ_z/2) ||Y − YX − E||_F^2
+              +  γ ( ||P||_{2,1} + ||Q||_{2,1} )
+        s.t.  X = C_off,   DC = P,   CD^T = Q,   diag(C) = 0
+
+    The only difference from ``ssc_admm_nuc_tv`` is the E-update, which uses
+    the column-wise block soft-threshold (group lasso proximal operator) instead
+    of the element-wise soft-threshold:
+
+        E_j = max(0, 1 − (λ_e/λ_z) / ||r_j||_2) · r_j,   r = Y − YX
+
+    This encourages entire columns of E to be zero, modelling sample-level
+    (rather than entry-level) corruption. TV uses L2,1 on both P and Q.
+
+    Parameters
+    ----------
+    Y        : ndarray (n, N)   data matrix (columns = data points)
+    lambda_e : float            weight on ||E||_{2,1}
+    lambda_z : float            weight on reconstruction loss
+    gamma    : float            TV weight  γ(||P||_{2,1} + ||Q||_{2,1})
+    mu       : float            ADMM penalty for the X = C_off constraint
+    sigma    : float            ADMM penalty for the TV auxiliary constraints
+    max_iter : int
+    tol      : float            convergence tolerance (max primal Frobenius residual)
+
+    Returns
+    -------
+    X, C, E : ndarrays
+    """
+    n, N = Y.shape
+
+    # ── Precompute static quantities ──────────────────────────────────────────
+    D = finite_diff_matrix(N)
+    K = D.T @ D
+    eigs, V = np.linalg.eigh(K)
+
+    denom = mu + sigma * (eigs[:, None] + eigs[None, :])
+    A_inv = np.linalg.inv(lambda_z * (Y.T @ Y) + mu * np.eye(N))
+
+    # ── Initialise primal and dual variables ──────────────────────────────────
+    X = np.zeros((N, N))
+    C = np.zeros((N, N))
+    E = np.zeros((n, N))
+    P = np.zeros((N - 1, N))
+    Q = np.zeros((N, N - 1))
+
+    Lambda = np.zeros((N, N))
+    Pi_P   = np.zeros((N - 1, N))
+    Pi_Q   = np.zeros((N, N - 1))
+
+    for it in range(max_iter):
+        X_prev = X
+
+        # 1. X-update
+        C_off = C - np.diag(np.diag(C))
+        X = A_inv @ (lambda_z * (Y.T @ (Y - E)) + mu * C_off - Lambda)
+
+        # 2. C-update (Sylvester equation via eigendecomposition of K)
+        P_tilde = P - Pi_P / sigma
+        Q_tilde = Q - Pi_Q / sigma
+        RHS_C   = mu * (X + Lambda / mu) + sigma * (D.T @ P_tilde + Q_tilde @ D)
+        C = V @ ((V.T @ RHS_C @ V) / denom) @ V.T
+        np.fill_diagonal(C, 0.0)
+
+        # 3-4. P- and Q-updates: column-wise group soft threshold (L2,1)
+        DC  = D @ C
+        CDt = C @ D.T
+        P = block_soft_threshold_cols(DC  + Pi_P / sigma, gamma / sigma)
+        Q = block_soft_threshold_cols(CDt + Pi_Q / sigma, gamma / sigma)
+
+        # 5. E-update — column-wise block soft-threshold (L2,1 proximal step)
+        E = block_soft_threshold_cols(Y - Y @ X, lambda_e / lambda_z)
+
+        # 6. Dual updates
+        C_off = C - np.diag(np.diag(C))
+        Lambda += mu    * (X   - C_off)
+        Pi_P   += sigma * (DC  - P)
+        Pi_Q   += sigma * (CDt - Q)
+
+        # Convergence check
+        primal_res = max(
+            np.linalg.norm(X   - C_off, 'fro'),
+            np.linalg.norm(DC  - P,     'fro'),
+            np.linalg.norm(CDt - Q,     'fro'),
+        )
+        dual_res = mu * np.linalg.norm(X - X_prev, 'fro')
+        if primal_res < tol and dual_res < tol:
+            break
+
+    return X, C, E
+
+
+# ── Clustering ────────────────────────────────────────────────────────────────
+
+def cluster_from_C(C, k=None, k_max=None):
+    """Spectral clustering on the symmetric affinity W = |C| + |C|^T.
+
+    If ``k`` is None it is estimated with the eigengap heuristic on the
+    symmetrically-normalised affinity D^{-½} W D^{-½}: k is the index of the
+    largest drop between consecutive (descending) eigenvalues, clipped to
+    ``[1, k_max]``.  ``k_max`` defaults to N // 20.
+    """
+    W = np.abs(C) + np.abs(C.T)
+
+    if k is None:
+        if k_max is None:
+            k_max = max(1, C.shape[0] // 20)
+        d = np.maximum(W.sum(axis=1), 1e-12)
+        d_inv_sqrt = 1.0 / np.sqrt(d)
+        W_norm = d_inv_sqrt[:, None] * W * d_inv_sqrt[None, :]
+        eigvals = np.linalg.eigvalsh(W_norm)[::-1]   # descending
+        gaps = eigvals[:-1] - eigvals[1:]
+        k = int(np.clip(np.argmax(gaps) + 1, 1, k_max))
+
+    sc = SpectralClustering(n_clusters=k, affinity='precomputed',
+                            assign_labels='kmeans', random_state=0)
+    return sc.fit_predict(W)
+
+
+# ── Synthetic sanity check ──────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    import time
+    from sklearn.metrics import adjusted_rand_score
+
+    cluster_sizes = [20, 25, 15, 20]
+    rng = np.random.default_rng(42)
+    labels = np.repeat(np.arange(len(cluster_sizes)), cluster_sizes)
+    same = labels[:, None] == labels[None, :]
+    probs = np.where(same, 0.75, 0.05)
+    N = sum(cluster_sizes)
+    upper = np.triu(rng.random((N, N)) < probs, k=0).astype(float)
+    Y = upper + upper.T - np.diag(np.diag(upper))
+
+    print(f"Y: {Y.shape},  clusters: {cluster_sizes}\n")
+    t0 = time.perf_counter()
+    X, C, E = ssc_admm_nuc_tv(Y, lambda_e=1.0, lambda_z=0.1, gamma=0.1)
+    pred = cluster_from_C(X, k=len(cluster_sizes))
+    print(f"ARI = {adjusted_rand_score(labels, pred):.4f}   "
+          f"time = {time.perf_counter() - t0:.2f}s")
