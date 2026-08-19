@@ -1,13 +1,17 @@
 """
-SBM benchmark of OSC vs six SSC-TV ADMM variants.
+SBM benchmark of OSC, six SSC-TV ADMM variants, and Temporal K-Subspaces
+(TKSS).  TKSS is a sequential K-subspaces method: it returns labels
+directly (no coefficient matrix / spectral clustering).  Subspace
+dimension d, sequential weight λ, and neighbor window s are the
+tunable knobs; k is the true number of SBM blocks.
 
 Protocol
 --------
 200×200 undirected SBM test cases, Poisson observation noise with
 rate λ ∈ {0, 0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.00}
 (λ = 0 is the noiseless adjacency), 5 independent draws per (case, λ).
-Spectral clustering uses the true number of SBM blocks k on
-W = |C| + |C|^T (OSC: |Z| + |Z|^T).
+Spectral clustering (OSC / SSC-TV) uses the true number of SBM blocks k
+on W = |C| + |C|^T (OSC: |Z| + |Z|^T).  TKSS is given the same k.
 
 Cases
 -----
@@ -29,17 +33,24 @@ Probability sweep (sizes 50, 60, 90)
  11. Dense: p_in=0.8, p_out=0.2
  12. Weak communities: p_in=0.25, p_out=0.12
 
-Solvers are imported from the existing ADMM modules. SSC-TV max_iter is
-raised to 200 to match OSC.  File defaults are used unless ``--params``
-points at a JSON file written by ``tune_hyperparams.py``.
+Each observation matrix Y is Frobenius-normalised before clustering or
+tuning.  SSC-TV variants fix λ_z = 1 and tune the remaining penalties
+relative to it; λ_e21 stored in JSON is the pre-scale value and is
+multiplied by √N at call time (N = number of columns of Y).
+
+ADMM solvers are imported from the existing modules; SSC-TV max_iter is
+raised to 200 to match OSC.  TKSS uses alternating subspace / assignment
+updates (default 50 iters, early stop).  File defaults are used unless
+``--params`` points at a JSON file written by ``tune_hyperparams.py``
+(Optuna TPE, one vector per method).
 
 Usage
 -----
-    python benchmark_sbm.py
-    python benchmark_sbm.py --trials 5 --out-dir results
+    python tune_hyperparams.py                  # Optuna TPE, all 8 methods
+    python tune_hyperparams.py --retune OSC     # one method; merge into JSON
     python benchmark_sbm.py --params results/best_hyperparams.json --out-dir results/tuned
-    python benchmark_sbm.py --params results/best_hyperparams.json --out-dir results/expanded
-    python benchmark_sbm.py --smoke          # one trial, λ=0, case 1 only
+    python benchmark_sbm.py --trials 5 --out-dir results
+    python benchmark_sbm.py --smoke             # one trial, λ=0, case 1 only
 """
 
 from __future__ import annotations
@@ -60,8 +71,9 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from osc import cluster_from_Z, osc_admm  # noqa: E402
+from osc import cluster_from_Z, osc_exact  # noqa: E402
 from ssc_tv import cluster_from_C, ssc_admm_nuc_tv as ssc_tv_admm  # noqa: E402
+from tkss import tkss_cluster  # noqa: E402
 
 
 # ── module loading ────────────────────────────────────────────────────────────
@@ -96,12 +108,18 @@ _mod_e1e21_l21_pq = _load_py(
 )
 
 
-# Shared ADMM settings: file defaults, SSC max_iter aligned with OSC.
-SSC_DEFAULTS = dict(lambda_e=1.0, lambda_z=0.1, gamma=0.1, mu=1.0, sigma=1.0,
+# lambda_z is fixed at 1; other ADMM penalties are tuned relative to it.
+# lambda_e21 in defaults / JSON is the *pre-scale* value; make_solver multiplies
+# by sqrt(N) at call time (N = number of columns of Y).
+LAMBDA_Z = 1.0
+SSC_DEFAULTS = dict(lambda_e=1.0, lambda_z=LAMBDA_Z, gamma=0.1, mu=1.0, sigma=1.0,
                     max_iter=200, tol=1e-4)
-E1E21_DEFAULTS = dict(lambda_e1=1.0, lambda_e21=1.0, lambda_z=0.1, gamma=0.1,
+E1E21_DEFAULTS = dict(lambda_e1=1.0, lambda_e21=1.0, lambda_z=LAMBDA_Z, gamma=0.1,
                       mu=1.0, sigma=1.0, rho=1.0, max_iter=200, tol=1e-4)
-OSC_DEFAULTS = dict(lambda1=0.1, lambda2=1.0, mu=1.0, max_iter=200)
+# osc_exact (SubKit / osc.m): λ1 on ||Z||_1, λ2 on ||ZR||_{1,2}, mu default 0.1.
+# Tuner / JSON still use lambda1/lambda2; make_solver maps them onto lambda_1/lambda_2.
+OSC_DEFAULTS = dict(lambda1=0.1, lambda2=1.0, mu=0.1, max_iter=200)
+TKSS_DEFAULTS = dict(lam=1.0, s=1, d=1, max_iter=200, random_state=0)
 
 # Back-compat aliases used by older call sites / the tuner.
 SSC_KW = SSC_DEFAULTS
@@ -121,21 +139,89 @@ METHOD_SPECS = [
          solver=_mod_e1e21_l21_p.ssc_admm_nuc_tv_e1_e21, defaults=E1E21_DEFAULTS),
     dict(name="SSC-TV-E1E21-L21-PQ", kind="ssc",
          solver=_mod_e1e21_l21_pq.ssc_admm_nuc_tv_e1_e21, defaults=E1E21_DEFAULTS),
+    dict(name="TKSS", kind="tkss", solver=tkss_cluster, defaults=TKSS_DEFAULTS),
 ]
+
+METHOD_KIND = {s["name"]: s["kind"] for s in METHOD_SPECS}
+
+
+def _osc_exact_kwargs(kw):
+    """Map tuner / JSON keys onto ``osc_exact``'s MATLAB-style signature."""
+    out = {}
+    if "lambda_1" in kw:
+        out["lambda_1"] = float(kw["lambda_1"])
+    elif "lambda1" in kw:
+        out["lambda_1"] = float(kw["lambda1"])
+    if "lambda_2" in kw:
+        out["lambda_2"] = float(kw["lambda_2"])
+    elif "lambda2" in kw:
+        out["lambda_2"] = float(kw["lambda2"])
+    if "mu" in kw:
+        out["mu"] = float(kw["mu"])
+    if "diagconstraint" in kw:
+        out["diagconstraint"] = bool(kw["diagconstraint"])
+    elif "diag_zero" in kw:
+        out["diagconstraint"] = bool(kw["diag_zero"])
+    if "max_iter" in kw:
+        out["max_iter"] = int(kw["max_iter"])
+    return out
+
+
+def normalize_Y(Y):
+    """Unit-Frobenius scale so ADMM penalties stay relative to ``lambda_z=1``."""
+    Y = np.asarray(Y, dtype=float)
+    scale = np.linalg.norm(Y, "fro")
+    if not np.isfinite(scale) or scale == 0.0:
+        return Y
+    return Y / scale
+
+
+def _ssc_call_kwargs(kw, Y):
+    """Fix ``lambda_z=1`` and scale ``lambda_e21`` by ``sqrt(N)`` (pre-scale in kw)."""
+    call_kw = dict(kw)
+    call_kw["lambda_z"] = LAMBDA_Z
+    if "lambda_e21" in call_kw:
+        n_cols = int(Y.shape[1])
+        call_kw["lambda_e21"] = float(call_kw["lambda_e21"]) * np.sqrt(n_cols)
+    return call_kw
 
 
 def make_solver(spec, kwargs):
-    """Bind an ADMM solver spec to a kwargs dict; returns (coeff, E, F)."""
+    """Bind a solver spec to a kwargs dict.
+
+    ADMM methods (OSC / SSC-TV): ``fn(Y) -> (coeff, E, F)``.
+    TKSS: ``fn(Y, k) -> (labels, residual)``.
+
+    SSC variants always run with ``lambda_z=1``.  ``lambda_e21`` stored in
+    kwargs / JSON is the value *before* the ``sqrt(N)`` column-count scale.
+    """
     kw = dict(kwargs)
+    if spec["kind"] == "ssc":
+        kw["lambda_z"] = LAMBDA_Z
     if spec["kind"] == "osc":
         def fn(Y, _kw=kw):
-            Z, E, _J = osc_admm(Y, **_kw)
+            Z = osc_exact(Y, **_osc_exact_kwargs(_kw))
+            E = Y - Y @ Z
             return Z, E, None
+        return fn
+    if spec["kind"] == "tkss":
+        def fn(Y, k, _kw=kw):
+            d = int(round(_kw.get("d", 1)))
+            s = int(round(_kw.get("s", 1)))
+            return tkss_cluster(
+                Y,
+                k=int(k),
+                d=max(1, d),
+                lam=float(_kw.get("lam", 1.0)),
+                s=max(0, s),
+                max_iter=int(_kw.get("max_iter", 50)),
+                random_state=_kw.get("random_state", 0),
+            )
         return fn
     solver = spec["solver"]
 
     def fn(Y, _kw=kw, _solver=solver):
-        out = _solver(Y, **_kw)
+        out = _solver(Y, **_ssc_call_kwargs(_kw, Y))
         C, E = out[1], out[2]
         F = out[3] if len(out) > 3 else None
         return C, E, F
@@ -151,10 +237,12 @@ def build_methods(overrides=None, max_iter=None, names=None):
         if spec["name"] not in wanted:
             continue
         kw = dict(spec["defaults"])
-        if max_iter is not None:
+        if max_iter is not None and spec["kind"] != "tkss":
             kw["max_iter"] = max_iter
         extra = overrides.get(spec["name"], {})
         kw.update(extra)
+        if spec["kind"] == "ssc":
+            kw["lambda_z"] = LAMBDA_Z
         methods.append((spec["name"], make_solver(spec, kw)))
     return methods
 
@@ -162,7 +250,12 @@ def build_methods(overrides=None, max_iter=None, names=None):
 def load_param_overrides(path):
     data = json.loads(Path(path).read_text())
     methods = data.get("methods", data)
-    return {name: dict(info.get("params", info)) for name, info in methods.items()}
+    overrides = {}
+    for name, info in methods.items():
+        params = dict(info.get("params", info))
+        params.pop("lambda_z", None)  # always 1; ignore stale JSON values
+        overrides[name] = params
+    return overrides
 
 
 METHODS = build_methods()  # defaults; rebuilt in main() if --params is given
@@ -199,7 +292,7 @@ def add_poisson_noise(A, lam, rng):
 
 
 def inject_er_outliers(A, frac, p, rng):
-    """Replace rows/cols of ``frac`` randomly chosen nodes by ER(p) edges."""
+    """Replace rows/cols of ``frac`` randomly chosen nodes by ER(p) edges. This is for outlier column test."""
     n = A.shape[0]
     n_out = int(round(frac * n))
     idx = np.sort(rng.choice(n, size=n_out, replace=False))
@@ -340,14 +433,20 @@ FIELDNAMES = [
 
 
 def run_one(Y, labels, k, method_name, solver, outlier_mask):
+    Y = normalize_Y(Y)
     t0 = time.perf_counter()
-    coeff, E, F = solver(Y)
-    elapsed = time.perf_counter() - t0
-
-    if method_name == "OSC":
-        pred = cluster_from_Z(coeff, k=k)
+    if METHOD_KIND.get(method_name) == "tkss":
+        pred, residual = solver(Y, k)
+        elapsed = time.perf_counter() - t0
+        scores = residual
     else:
-        pred = cluster_from_C(coeff, k=k)
+        coeff, E, F = solver(Y)
+        elapsed = time.perf_counter() - t0
+        if method_name == "OSC":
+            pred = cluster_from_Z(coeff, k=k)
+        else:
+            pred = cluster_from_C(coeff, k=k)
+        scores = np.linalg.norm(F if F is not None else E, axis=0)
 
     if outlier_mask is None:
         ari = float(adjusted_rand_score(labels, pred))
@@ -355,7 +454,6 @@ def run_one(Y, labels, k, method_name, solver, outlier_mask):
     else:
         inliers = ~outlier_mask
         ari = float(adjusted_rand_score(labels[inliers], pred[inliers]))
-        scores = np.linalg.norm(F if F is not None else E, axis=0)
         prec, rec, f1 = outlier_prf(scores, outlier_mask)
 
     return {
@@ -376,6 +474,7 @@ def make_observation(cfg, lam, rng):
             A, cfg["outlier_frac"], cfg["outlier_p"], rng,
         )
     Y = add_poisson_noise(A, lam, rng)
+    Y = normalize_Y(Y)
     return Y, labels, outlier_mask
 
 
@@ -568,10 +667,12 @@ def write_summary(rows, out_dir, method_names=None):
 
 
 def plot_results(rows, out_dir, method_names=None):
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     methods = method_names or [s["name"] for s in METHOD_SPECS]
-    markers = ["o", "s", "D", "^", "v", "P", "X"]
+    markers = ["o", "s", "D", "^", "v", "P", "X", "*"]
     cases = [c for c in CASES if c in {r["case"] for r in rows}]
     if not cases:
         cases = sorted({r["case"] for r in rows})
@@ -658,6 +759,8 @@ def plot_results(rows, out_dir, method_names=None):
 
 def plot_runtime(rows, out_dir, methods):
     """Mean wall time per method, and ARI vs time (quality–cost)."""
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     means, stds, aris = [], [], []
@@ -676,7 +779,7 @@ def plot_runtime(rows, out_dir, methods):
     ax.set_xticks(x)
     ax.set_xticklabels(methods, rotation=25, ha="right")
     ax.set_ylabel("Wall time (s)")
-    ax.set_title("ADMM + spectral clustering, 200×200, max_iter=200")
+    ax.set_title("Clustering, 200×200")
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
     bar_path = out_dir / "runtime_by_method.png"
@@ -685,7 +788,7 @@ def plot_runtime(rows, out_dir, methods):
     print(f"Wrote {bar_path}", flush=True)
 
     fig, ax = plt.subplots(figsize=(7.2, 4.8))
-    markers = ["o", "s", "D", "^", "v", "P", "X"]
+    markers = ["o", "s", "D", "^", "v", "P", "X", "*"]
     for i, method in enumerate(methods):
         ax.scatter(
             means[i], aris[i], s=70, marker=markers[i % len(markers)],
@@ -806,7 +909,7 @@ def main():
     methods = build_methods(overrides=overrides, names=args.methods)
     n = len(cases) * len(lambdas) * n_trials * len(methods)
     print(
-        f"Running {n} ADMM jobs  "
+        f"Running {n} jobs  "
         f"({len(cases)} cases × {len(lambdas)} λ × {n_trials} trials "
         f"× {len(methods)} methods)",
         flush=True,

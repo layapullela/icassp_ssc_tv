@@ -1,5 +1,5 @@
 """
-Held-out hyperparameter search for the seven ADMM methods.
+Held-out hyperparameter search for OSC, the SSC-TV ADMM variants, and TKSS.
 
 Protocol
 --------
@@ -7,15 +7,21 @@ One hyperparameter vector per method (not per case / not per noise level).
 Validation graphs use a different RNG seed from the test benchmark so the
 selected values are not fit on the numbers we later report.
 
+Each Y is Frobenius-normalised.  SSC-TV λ_z is fixed at 1 (not searched);
+other penalties are log-uniform on [1e-5, 10].  λ_e21 is tuned pre-scale
+and multiplied by sqrt(N) at solve time.
+
 Validation design
-    cases   : all four SBM cases
-    λ       : {0.0, 0.10}   (noiseless + moderate Poisson; not the full test grid)
+    cases   : original four SBM cases (held out from the size/probability sweeps)
+    λ       : {0.0, 0.10, 0.50, 1.00}  (noiseless, moderate, and high Poisson;
+              not the full test grid — 0.05 / 0.20 / 0.30 / 0.75 stay held out)
     trials  : 2
     seed    : 1_000_003     (benchmark test seed is 0)
     max_iter: 80            (faster; winners are re-evaluated at 200)
+    search  : Optuna TPE over every method (40 trials/method)
 
 Objective (to maximize)
-    score = mean ARI  +  0.25 × mean case-4 outlier F1
+    score = mean ARI + (also can look at F1 score for outlier detection, but this is disabled for now)
           (F1 is 0 when a config never produces a finite F1)
 
 ARI is primary so clustering quality still dominates; the F1 bonus is
@@ -23,8 +29,9 @@ there so SSC variants are not rewarded for zeroing E.
 
 Usage
 -----
-    python tune_hyperparams.py
-    python tune_hyperparams.py --quick          # 1 trial, cases 1 and 4 only
+    python tune_hyperparams.py                  # Optuna TPE, all methods
+    python tune_hyperparams.py --quick          # 1 graph trial, cases 1 and 4 only
+    python tune_hyperparams.py --retune OSC     # one method; merge into existing JSON
     python benchmark_sbm.py --params results/best_hyperparams.json \\
         --out-dir results/tuned
 """
@@ -33,71 +40,73 @@ from __future__ import annotations
 
 import argparse
 import csv
-import itertools
 import json
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
+import optuna
 
 import benchmark_sbm as bench
 
 ROOT = Path(__file__).resolve().parent
 
-# Compact log-style grids.  Defaults from each solver file are included.
-# OSC is searched as densely as the 3-weight SSC grids (30 vs 27 points):
-# its objective only has two model weights (λ1 on ||Z||_1, λ2 on ||ZR||_{2,1}).
-GRIDS = {
-    "OSC": {
-        "lambda1": (0.01, 0.05, 0.1, 0.5, 1.0),
-        "lambda2": (0.1, 0.5, 1.0, 2.0, 5.0, 10.0),
-    },
-    "SSC-TV": {
-        "lambda_e": (0.05, 0.2, 1.0),
-        "lambda_z": (0.05, 0.1, 0.5),
-        "gamma": (0.01, 0.1, 0.5),
-    },
-    "SSC-TV-L21-P": {
-        "lambda_e": (0.05, 0.2, 1.0),
-        "lambda_z": (0.05, 0.1, 0.5),
-        "gamma": (0.01, 0.1, 0.5),
-    },
-    "SSC-TV-L21-PQ": {
-        "lambda_e": (0.05, 0.2, 1.0),
-        "lambda_z": (0.05, 0.1, 0.5),
-        "gamma": (0.01, 0.1, 0.5),
-    },
-    # λ_z is shared with the matching SSC-TV default scale; γ and the two
-    # E-weights are the degrees of freedom that actually distinguish E1E21.
-    "SSC-TV-E1E21": {
-        "lambda_e1": (0.05, 0.2, 1.0),
-        "lambda_e21": (0.05, 0.2, 1.0),
-        "lambda_z": (0.1,),
-        "gamma": (0.01, 0.1, 0.5),
-    },
-    "SSC-TV-E1E21-L21-P": {
-        "lambda_e1": (0.05, 0.2, 1.0),
-        "lambda_e21": (0.05, 0.2, 1.0),
-        "lambda_z": (0.1,),
-        "gamma": (0.01, 0.1, 0.5),
-    },
-    "SSC-TV-E1E21-L21-PQ": {
-        "lambda_e1": (0.05, 0.2, 1.0),
-        "lambda_e21": (0.05, 0.2, 1.0),
-        "lambda_z": (0.1,),
-        "gamma": (0.01, 0.1, 0.5),
-    },
-}
-
-F1_WEIGHT = 0.25
+F1_WEIGHT = 0 # TODO: decide if we want this in the loss
 VAL_SEED = 1_000_003
 TUNE_MAX_ITER = 80
+N_TRIALS = 40
+N_STARTUP_TRIALS = 10
+TUNE_CASES = [
+    "1_three_block",
+    "2_three_block_sparse",
+    "3_five_block",
+    "4_three_block_outliers",
+]
+TUNE_LAMBDAS = [0.0, 0.10, 0.50, 1.00]
 
-
-def configs_from_grid(grid):
-    keys = list(grid)
-    for values in itertools.product(*[grid[k] for k in keys]):
-        yield dict(zip(keys, values))
+# Log-uniform Optuna ranges.  λ_z is fixed at 1 (not searched); λ_e21 is the
+# pre-√N scale.  One space per METHOD_SPECS entry in benchmark_sbm.py.
+PARAM_RANGE = (1e-5, 10.0)
+SEARCH_SPACES = {
+    "OSC": {
+        "lambda1": PARAM_RANGE,
+        "lambda2": PARAM_RANGE,
+    },
+    "SSC-TV": {
+        "lambda_e": PARAM_RANGE,
+        "gamma": PARAM_RANGE,
+    },
+    "SSC-TV-L21-P": {
+        "lambda_e": PARAM_RANGE,
+        "gamma": PARAM_RANGE,
+    },
+    "SSC-TV-L21-PQ": {
+        "lambda_e": PARAM_RANGE,
+        "gamma": PARAM_RANGE,
+    },
+    "SSC-TV-E1E21": {
+        "lambda_e1": PARAM_RANGE,
+        "lambda_e21": PARAM_RANGE,
+        "gamma": PARAM_RANGE,
+    },
+    "SSC-TV-E1E21-L21-P": {
+        "lambda_e1": PARAM_RANGE,
+        "lambda_e21": PARAM_RANGE,
+        "gamma": PARAM_RANGE,
+    },
+    "SSC-TV-E1E21-L21-PQ": {
+        "lambda_e1": PARAM_RANGE,
+        "lambda_e21": PARAM_RANGE,
+        "gamma": PARAM_RANGE,
+    },
+    "TKSS": {
+        "lam": PARAM_RANGE,
+        "s": (1, 8),
+        "d": (1, 6),
+    },
+}
+INT_SEARCH_KEYS = {"s", "d"}
 
 
 def spec_by_name(name):
@@ -151,53 +160,138 @@ def eval_solver(solver, name, graphs):
     return ari, f1, score
 
 
-def tune_method(name, grid, graphs, max_iter):
+def suggest_params(trial, name):
+    space = SEARCH_SPACES[name]
+    params = {}
+    for key, (lo, hi) in space.items():
+        if key in INT_SEARCH_KEYS:
+            params[key] = trial.suggest_int(key, int(lo), int(hi))
+        else:
+            params[key] = trial.suggest_float(key, lo, hi, log=True)
+    return params
+
+
+def default_search_params(name):
     spec = spec_by_name(name)
-    best = None
-    rows = []
-    configs = list(configs_from_grid(grid))
-    t0 = time.perf_counter()
-    for i, extra in enumerate(configs, 1):
-        kw = dict(spec["defaults"])
+    out = {}
+    for key in SEARCH_SPACES[name]:
+        v = spec["defaults"][key]
+        out[key] = int(v) if key in INT_SEARCH_KEYS else float(v)
+    return out
+
+
+def _eval_config(name, extra, graphs, max_iter):
+    spec = spec_by_name(name)
+    kw = dict(spec["defaults"])
+    if spec["kind"] != "tkss":
         kw["max_iter"] = max_iter
-        kw.update(extra)
-        solver = bench.make_solver(spec, kw)
-        ari, f1, score = eval_solver(solver, name, graphs)
-        rec = {
-            "method": name,
-            **{k: extra[k] for k in extra},
-            "val_ari": ari,
-            "val_f1": f1,
-            "score": score,
+    kw.update(extra)
+    if spec["kind"] == "ssc":
+        kw["lambda_z"] = bench.LAMBDA_Z
+    solver = bench.make_solver(spec, kw)
+    return eval_solver(solver, name, graphs)
+
+
+def tune_method_optuna(
+    name, graphs, max_iter, n_trials, n_startup, seed, storage_path, resume,
+):
+    if name not in SEARCH_SPACES:
+        raise KeyError(f"no Optuna search space for {name}")
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", optuna.exceptions.ExperimentalWarning)
+        sampler = optuna.samplers.TPESampler(
+            seed=seed,
+            multivariate=True,
+            n_startup_trials=n_startup,
+        )
+    db_url = f"sqlite:///{Path(storage_path).resolve()}"
+    storage = optuna.storages.RDBStorage(url=db_url)
+    if not resume:
+        try:
+            optuna.delete_study(study_name=name, storage=storage)
+        except (KeyError, optuna.exceptions.OptunaError):
+            pass
+    study = optuna.create_study(
+        study_name=name,
+        storage=storage,
+        direction="maximize",
+        sampler=sampler,
+        load_if_exists=resume,
+    )
+    if not resume or len(study.trials) == 0:
+        study.enqueue_trial(default_search_params(name))
+
+    def n_finished(s):
+        finished = {
+            optuna.trial.TrialState.COMPLETE,
+            optuna.trial.TrialState.FAIL,
+            optuna.trial.TrialState.PRUNED,
         }
-        rows.append(rec)
+        return sum(t.state in finished for t in s.trials)
+
+    t0 = time.perf_counter()
+    n_done_start = n_finished(study)
+    remaining = n_trials if not resume else max(n_trials - n_done_start, 0)
+    target = n_done_start + remaining
+
+    def objective(trial):
+        extra = suggest_params(trial, name)
+        ari, f1, score = _eval_config(name, extra, graphs, max_iter)
+        trial.set_user_attr("val_ari", ari)
+        trial.set_user_attr("val_f1", f1)
+        if not np.isfinite(score):
+            return -1.0
+        return score
+
+    def callback(study, trial):
+        done = n_finished(study)
         elapsed = time.perf_counter() - t0
-        eta = (elapsed / i) * (len(configs) - i)
+        left = max(target - done, 0)
+        eta = (elapsed / max(done - n_done_start, 1)) * left
+        value = trial.value
+        score_s = f"{value:.3f}" if value is not None and np.isfinite(value) else "nan"
+        try:
+            best_s = f"{study.best_value:.3f}"
+        except ValueError:
+            best_s = "n/a"
+        ari = trial.user_attrs.get("val_ari")
+        f1 = trial.user_attrs.get("val_f1")
+        ari_s = f"{ari:.3f}" if ari is not None and np.isfinite(ari) else "nan"
+        f1_s = f"{f1:.3f}" if f1 is not None and np.isfinite(f1) else "nan"
         print(
-            f"  [{i}/{len(configs)}] {name}  {extra}  "
-            f"ARI={ari:.3f}  F1={f1:.3f}  score={score:.3f}  "
+            f"  [{done}/{target}] {name}  {trial.params}  "
+            f"ARI={ari_s}  F1={f1_s}  score={score_s}  best={best_s}  "
             f"ETA {eta:.0f}s",
             flush=True,
         )
-        if best is None or score > best["score"] + 1e-12:
-            best = {
-                "params": extra,
-                "val_ari": ari,
-                "val_f1": f1,
-                "score": score,
-            }
-        elif best is not None and abs(score - best["score"]) <= 1e-12:
-            # Tie-break: prefer the file default when scores match, else fewer
-            # large weights (sum of log params as a roughness penalty).
-            def roughness(p):
-                return sum(abs(np.log10(max(v, 1e-12))) for v in p.values())
-            if roughness(extra) < roughness(best["params"]):
-                best = {
-                    "params": extra,
-                    "val_ari": ari,
-                    "val_f1": f1,
-                    "score": score,
-                }
+
+    if remaining:
+        study.optimize(objective, n_trials=remaining, callbacks=[callback])
+
+    best_trial = study.best_trial
+    params = {}
+    for k, v in best_trial.params.items():
+        params[k] = int(v) if k in INT_SEARCH_KEYS else float(v)
+    best = {
+        "params": params,
+        "val_ari": float(best_trial.user_attrs.get("val_ari", best_trial.value)),
+        "val_f1": float(best_trial.user_attrs.get("val_f1", 0.0)),
+        "score": float(best_trial.value),
+        "n_trials": len(study.trials),
+    }
+    rows = []
+    for t in study.trials:
+        rec = {
+            "method": name,
+            "trial": t.number,
+            "val_ari": t.user_attrs.get("val_ari", t.value),
+            "val_f1": t.user_attrs.get("val_f1"),
+            "score": t.value,
+        }
+        rec.update(t.params)
+        rows.append(rec)
     return best, rows
 
 
@@ -209,10 +303,11 @@ def parse_args():
     p.add_argument("--trials", type=int, default=2)
     p.add_argument("--max-iter", type=int, default=TUNE_MAX_ITER)
     p.add_argument(
-        "--lambdas", type=float, nargs="+", default=[0.0, 0.10],
+        "--lambdas", type=float, nargs="+", default=list(TUNE_LAMBDAS),
+        help="Poisson rates on the tune graphs (default: 0, 0.10, 0.50, 1.00).",
     )
     p.add_argument(
-        "--cases", nargs="+", default=list(bench.CASES),
+        "--cases", nargs="+", default=list(TUNE_CASES),
         choices=list(bench.CASES),
     )
     p.add_argument(
@@ -221,8 +316,31 @@ def parse_args():
         choices=[s["name"] for s in bench.METHOD_SPECS],
     )
     p.add_argument(
+        "--retune", nargs="+", default=None,
+        choices=[s["name"] for s in bench.METHOD_SPECS],
+        metavar="METHOD",
+        help="Only search these methods and merge the winners into existing "
+             "best_hyperparams.json / tune_grid.csv. Example: --retune OSC",
+    )
+    p.add_argument(
+        "--n-trials", type=int, default=N_TRIALS,
+        help="Optuna trials per method. Default 40.",
+    )
+    p.add_argument(
+        "--n-startup-trials", type=int, default=N_STARTUP_TRIALS,
+        help="Random TPE warmup trials before Bayesian proposals. Default 10.",
+    )
+    p.add_argument(
+        "--tune-seed", type=int, default=0,
+        help="Optuna TPESampler seed.",
+    )
+    p.add_argument(
+        "--resume", action="store_true",
+        help="Continue Optuna studies stored in out-dir/optuna.db.",
+    )
+    p.add_argument(
         "--quick", action="store_true",
-        help="1 trial, cases 1 and 4 only — sanity-check the search loop.",
+        help="1 graph trial, cases 1 and 4 only — sanity-check the search loop.",
     )
     p.add_argument(
         "--f1-weight", type=float, default=F1_WEIGHT,
@@ -239,42 +357,62 @@ def main():
     args = parse_args()
     global F1_WEIGHT
     F1_WEIGHT = args.f1_weight
+    if args.retune:
+        args.methods = list(args.retune)
+        args.merge = True
+        print(f"Retune: {', '.join(args.methods)}  (merging into existing files)",
+              flush=True)
 
     cases = args.cases
-    n_trials = args.trials
+    n_graph_trials = args.trials
+    n_optuna_trials = args.n_trials
     if args.quick:
         cases = ["1_three_block", "4_three_block_outliers"]
-        n_trials = 1
-        print("Quick mode: cases 1+4, 1 trial.", flush=True)
+        n_graph_trials = 1
+        if args.n_trials == N_TRIALS:
+            n_optuna_trials = 3
+        print(
+            f"Quick mode: cases 1+4, 1 graph trial, {n_optuna_trials} Optuna trials.",
+            flush=True,
+        )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(
         f"Building validation graphs  "
-        f"({len(cases)} cases × {len(args.lambdas)} λ × {n_trials} trials, "
+        f"({len(cases)} cases × {len(args.lambdas)} λ × {n_graph_trials} trials, "
         f"seed={args.seed}) …",
         flush=True,
     )
-    graphs = build_val_graphs(cases, args.lambdas, n_trials, args.seed)
+    graphs = build_val_graphs(cases, args.lambdas, n_graph_trials, args.seed)
     print(f"  {len(graphs)} graphs, Y shape {graphs[0]['Y'].shape}", flush=True)
 
-    n_configs = sum(len(list(configs_from_grid(GRIDS[m]))) for m in args.methods)
-    n_jobs = n_configs * len(graphs)
+    n_jobs = n_optuna_trials * len(args.methods) * len(graphs)
     print(
-        f"Search: {n_configs} configs × {len(graphs)} graphs "
-        f"= {n_jobs} ADMM runs  (max_iter={args.max_iter})",
+        f"Search: Optuna TPE, {n_optuna_trials} trials × {len(args.methods)} methods "
+        f"× {len(graphs)} graphs = {n_jobs} solver runs  "
+        f"(max_iter={args.max_iter})",
         flush=True,
     )
 
     all_rows = []
     selected = {}
     t_start = time.perf_counter()
+    storage_path = out_dir / "optuna.db"
     for name in args.methods:
-        print(f"\n=== {name}  ({len(list(configs_from_grid(GRIDS[name])))} configs) ===",
-              flush=True)
-        best, rows = tune_method(
-            name, GRIDS[name], graphs, args.max_iter,
+        print(
+            f"\n=== {name}  (Optuna TPE, {n_optuna_trials} trials × "
+            f"{len(graphs)} graphs, max_iter={args.max_iter}) ===",
+            flush=True,
+        )
+        best, rows = tune_method_optuna(
+            name, graphs, args.max_iter,
+            n_trials=n_optuna_trials,
+            n_startup=args.n_startup_trials,
+            seed=args.tune_seed,
+            storage_path=storage_path,
+            resume=args.resume,
         )
         all_rows.extend(rows)
         selected[name] = best
@@ -294,9 +432,10 @@ def main():
                 r for r in csv.DictReader(fh) if r.get("method") not in args.methods
             ]
     combined = existing_rows + all_rows
+    skip = {"method", "val_ari", "val_f1", "score"}
     param_keys = sorted({
         k for r in combined for k in r
-        if k not in ("method", "val_ari", "val_f1", "score") and r.get(k) not in ("", None)
+        if k not in skip and r.get(k) not in ("", None)
     })
     with csv_path.open("w", newline="") as fh:
         fields = ["method", *param_keys, "val_ari", "val_f1", "score"]
@@ -307,14 +446,27 @@ def main():
     print(f"\nWrote {csv_path}", flush=True)
 
     json_path = out_dir / "best_hyperparams.json"
+    elapsed = time.perf_counter() - t_start
+    protocol_extra = {
+        "search": "optuna",
+        "sampler": "TPESampler(multivariate=True)",
+        "n_optuna_trials": n_optuna_trials,
+        "n_startup_trials": args.n_startup_trials,
+        "search_spaces": {m: SEARCH_SPACES[m] for m in args.methods},
+        "y_normalization": "frobenius",
+        "lambda_z": bench.LAMBDA_Z,
+        "lambda_e21_scale": "sqrt(N)",
+    }
     if args.merge and json_path.exists():
         payload = json.loads(json_path.read_text())
         payload.setdefault("methods", {}).update(selected)
-        payload.setdefault("protocol", {})["osc_retune"] = {
-            "n_configs": n_configs,
-            "elapsed_seconds": time.perf_counter() - t_start,
-            "grid": GRIDS.get("OSC"),
-        }
+        payload.setdefault("protocol", {}).update({
+            "elapsed_seconds": elapsed,
+            "retune": {
+                "methods": list(args.methods),
+                **protocol_extra,
+            },
+        })
     else:
         payload = {
             "protocol": {
@@ -322,13 +474,12 @@ def main():
                 "test_seed": 0,
                 "cases": cases,
                 "lambdas": list(args.lambdas),
-                "trials": n_trials,
+                "trials": n_graph_trials,
                 "max_iter_tune": args.max_iter,
                 "f1_weight": F1_WEIGHT,
                 "objective": "mean_ARI + f1_weight * mean_case4_F1",
-                "elapsed_seconds": time.perf_counter() - t_start,
-                "n_configs": {m: len(list(configs_from_grid(GRIDS[m])))
-                              for m in args.methods},
+                "elapsed_seconds": elapsed,
+                **protocol_extra,
             },
             "methods": selected,
         }
