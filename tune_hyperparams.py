@@ -12,9 +12,11 @@ other penalties are log-uniform on [1e-5, 10].  λ_e21 is tuned pre-scale
 and multiplied by sqrt(N) at solve time.
 
 Validation design
-    cases   : original four SBM cases (held out from the size/probability sweeps)
-    λ       : {0.0, 0.10, 0.50, 1.00}  (noiseless, moderate, and high Poisson;
-              not the full test grid — 0.05 / 0.20 / 0.30 / 0.75 stay held out)
+    cases   : every SBM test case (size, probability, and outlier sweeps).
+              Graphs are still drawn with a different RNG seed from the
+              reported benchmark, so the search is not fit on the test draws.
+    λ       : {0.0, 0.10, 0.50, 1.00, 2.00}  (noiseless through high Poisson;
+              0.05 / 0.20 / 0.30 / 0.75 / 1.50 / 3.00 stay held out)
     trials  : 2
     seed    : 1_000_003     (benchmark test seed is 0)
     max_iter: 80            (faster; winners are re-evaluated at 200)
@@ -57,13 +59,8 @@ VAL_SEED = 1_000_003
 TUNE_MAX_ITER = 80
 N_TRIALS = 40
 N_STARTUP_TRIALS = 10
-TUNE_CASES = [
-    "1_three_block",
-    "2_three_block_sparse",
-    "3_five_block",
-    "4_three_block_outliers",
-]
-TUNE_LAMBDAS = [0.0, 0.10, 0.50, 1.00]
+TUNE_CASES = list(bench.CASES)
+TUNE_LAMBDAS = [0.0, 0.10, 0.50, 1.00, 2.00]
 
 # Log-uniform Optuna ranges.  λ_z is fixed at 1 (not searched); λ_e21 is the
 # pre-√N scale.  One space per METHOD_SPECS entry in benchmark_sbm.py.
@@ -304,7 +301,7 @@ def parse_args():
     p.add_argument("--max-iter", type=int, default=TUNE_MAX_ITER)
     p.add_argument(
         "--lambdas", type=float, nargs="+", default=list(TUNE_LAMBDAS),
-        help="Poisson rates on the tune graphs (default: 0, 0.10, 0.50, 1.00).",
+        help="Poisson rates on the tune graphs (default: 0, 0.10, 0.50, 1.00, 2.00).",
     )
     p.add_argument(
         "--cases", nargs="+", default=list(TUNE_CASES),

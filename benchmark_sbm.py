@@ -8,8 +8,8 @@ tunable knobs; k is the true number of SBM blocks.
 Protocol
 --------
 200×200 undirected SBM test cases, Poisson observation noise with
-rate λ ∈ {0, 0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.00}
-(λ = 0 is the noiseless adjacency), 5 independent draws per (case, λ).
+rate λ ∈ {0, 0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.00, 1.50, 2.00, 3.00}
+(λ = 0 is the noiseless adjacency), 10 independent draws per (case, λ).
 Spectral clustering (OSC / SSC-TV) uses the true number of SBM blocks k
 on W = |C| + |C|^T (OSC: |Z| + |Z|^T).  TKSS is given the same k.
 
@@ -18,14 +18,18 @@ Cases
 Original
   1. 3 contiguous blocks (50, 60, 90), p_in=0.5, p_out=0.1
   2. Same partition, sparse: p_in=0.3, p_out=0.05
-  3. 5 contiguous blocks (30, 35, 40, 45, 50), p_in=0.5, p_out=0.1
+  3. 5 contiguous blocks (10, 20, 30, 50, 90), p_in=0.5, p_out=0.1
   4. Case 1 with 10% ER p=0.5 outlier nodes (ARI on inliers)
 
-Size sweep (p_in=0.5, p_out=0.1)
-  5. Equal 3-block (67, 67, 66)
-  6. Unbalanced 3-block (20, 50, 130)
-  7. Two-block (100, 100)
-  8. Eight-block (8 × 25)
+Size sweep (p_in=0.5, p_out=0.1).  Equal contiguous partitions are
+avoided: TKSS is initialised to K equal-length blocks, so those
+graphs would give it the ground-truth labels at iteration 0.
+  5. Mild 3-block (55, 65, 80)
+  6. Unbalanced 3-block (8, 32, 160)
+  7. Two-block (80, 120)
+  8. Eight-block (15, 18, 20, 22, 25, 28, 32, 40)
+ 13. Severe unbalanced 3-block (5, 15, 180)
+ 14. Twelve-block (8, 9, 10, 12, 13, 14, 16, 17, 19, 22, 25, 35)
 
 Probability sweep (sizes 50, 60, 90)
   9.  Hard overlap: p_in=0.4, p_out=0.2
@@ -342,12 +346,12 @@ CASES = {
         "title": "3-block sparse  p=0.3/0.05",
     },
     "3_five_block": {
-        "sizes": (30, 35, 40, 45, 50),
+        "sizes": (10, 20, 30, 50, 90),
         "p_in": 0.5,
         "p_out": 0.1,
         "outliers": False,
         "k": 5,
-        "title": "5-block  p=0.5/0.1",
+        "title": "5-block (10,20,30,50,90)  p=0.5/0.1",
     },
     "4_three_block_outliers": {
         "sizes": (50, 60, 90),
@@ -359,37 +363,37 @@ CASES = {
         "k": 3,
         "title": "3-block + 10% ER outliers",
     },
-    "5_equal_three": {
-        "sizes": (67, 67, 66),
+    "5_mild_three": {
+        "sizes": (55, 65, 80),
         "p_in": 0.5,
         "p_out": 0.1,
         "outliers": False,
         "k": 3,
-        "title": "equal 3-block (67,67,66)",
+        "title": "mild 3-block (55,65,80)",
     },
     "6_unbalanced_three": {
-        "sizes": (20, 50, 130),
+        "sizes": (8, 32, 160),
         "p_in": 0.5,
         "p_out": 0.1,
         "outliers": False,
         "k": 3,
-        "title": "unbalanced 3-block (20,50,130)",
+        "title": "unbalanced 3-block (8,32,160)",
     },
     "7_two_block": {
-        "sizes": (100, 100),
+        "sizes": (80, 120),
         "p_in": 0.5,
         "p_out": 0.1,
         "outliers": False,
         "k": 2,
-        "title": "2-block (100,100)",
+        "title": "2-block (80,120)",
     },
     "8_eight_block": {
-        "sizes": (25, 25, 25, 25, 25, 25, 25, 25),
+        "sizes": (15, 18, 20, 22, 25, 28, 32, 40),
         "p_in": 0.5,
         "p_out": 0.1,
         "outliers": False,
         "k": 8,
-        "title": "8-block (8×25)",
+        "title": "8-block (15–40)",
     },
     "9_hard_overlap": {
         "sizes": (50, 60, 90),
@@ -416,16 +420,60 @@ CASES = {
         "title": "dense  p=0.8/0.2",
     },
     "12_weak_community": {
-        "sizes": (50, 60, 90),
+        "sizes": (40, 60, 100),
         "p_in": 0.25,
         "p_out": 0.12,
         "outliers": False,
         "k": 3,
         "title": "weak communities  p=0.25/0.12",
     },
+    "13_severe_unbalanced": {
+        "sizes": (5, 15, 180),
+        "p_in": 0.5,
+        "p_out": 0.1,
+        "outliers": False,
+        "k": 3,
+        "title": "severe unbalanced (5,15,180)",
+    },
+    "14_twelve_block": {
+        "sizes": (8, 9, 10, 12, 13, 14, 16, 17, 19, 22, 25, 35),
+        "p_in": 0.5,
+        "p_out": 0.1,
+        "outliers": False,
+        "k": 12,
+        "title": "12-block (8–35)",
+    },
 }
 
-LAMBDAS = (0.0, 0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.00)
+LAMBDAS = (0.0, 0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.00, 1.50, 2.00, 3.00)
+
+# ARI vs λ is split across two figures so the 14 cases stay readable.
+ARI_PLOT_GROUPS = [
+    (
+        "ari_vs_lambda.png",
+        (
+            "1_three_block",
+            "2_three_block_sparse",
+            "3_five_block",
+            "4_three_block_outliers",
+            "9_hard_overlap",
+            "10_very_sparse",
+            "11_dense",
+            "12_weak_community",
+        ),
+    ),
+    (
+        "ari_vs_lambda_size.png",
+        (
+            "5_mild_three",
+            "6_unbalanced_three",
+            "7_two_block",
+            "8_eight_block",
+            "13_severe_unbalanced",
+            "14_twelve_block",
+        ),
+    ),
+]
 FIELDNAMES = [
     "case", "lambda", "trial", "method",
     "ari", "precision", "recall", "f1", "seconds", "error",
@@ -666,18 +714,13 @@ def write_summary(rows, out_dir, method_names=None):
         )
 
 
-def plot_results(rows, out_dir, method_names=None):
-    import matplotlib
-    matplotlib.use("Agg")
+def _plot_ari_grid(rows, cases, methods, markers, out_path):
+    """One ARI-vs-λ figure for a subset of cases."""
     import matplotlib.pyplot as plt
 
-    methods = method_names or [s["name"] for s in METHOD_SPECS]
-    markers = ["o", "s", "D", "^", "v", "P", "X", "*"]
-    cases = [c for c in CASES if c in {r["case"] for r in rows}]
-    if not cases:
-        cases = sorted({r["case"] for r in rows})
-
     n = len(cases)
+    if n == 0:
+        return
     ncols = 3 if n > 4 else 2
     nrows = int(np.ceil(n / ncols))
     fig, axes = plt.subplots(
@@ -713,10 +756,32 @@ def plot_results(rows, out_dir, method_names=None):
     fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False,
                bbox_to_anchor=(0.5, 1.01))
     fig.tight_layout(rect=(0, 0, 1, 0.97))
-    ari_path = out_dir / "ari_vs_lambda.png"
-    fig.savefig(ari_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Wrote {ari_path}", flush=True)
+    print(f"Wrote {out_path}", flush=True)
+
+
+def plot_results(rows, out_dir, method_names=None):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    methods = method_names or [s["name"] for s in METHOD_SPECS]
+    markers = ["o", "s", "D", "^", "v", "P", "X", "*"]
+    present = {r["case"] for r in rows}
+    grouped = set()
+    for filename, group in ARI_PLOT_GROUPS:
+        cases = [c for c in group if c in present]
+        grouped.update(cases)
+        _plot_ari_grid(rows, cases, methods, markers, Path(out_dir) / filename)
+
+    leftover = [c for c in CASES if c in present and c not in grouped]
+    leftover += [c for c in sorted(present) if c not in grouped and c not in CASES]
+    if leftover:
+        _plot_ari_grid(
+            rows, leftover, methods, markers,
+            Path(out_dir) / "ari_vs_lambda_other.png",
+        )
 
     case4 = [r for r in rows if r["case"] == "4_three_block_outliers"]
     if case4:
@@ -835,7 +900,7 @@ def plot_runtime(rows, out_dir, methods):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--trials", type=int, default=5)
+    p.add_argument("--trials", type=int, default=10)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", type=str, default=str(ROOT / "results"))
     p.add_argument(
