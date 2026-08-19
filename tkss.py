@@ -73,7 +73,11 @@ def tkss(X, K, d, lam=1.0, s=1, max_iter=50, random_state=None):
     s = int(max(0, s))
     #breakpoint()
 
-    labels = rng.randint(0, K, size=N) # TODO: we should intiialize with a sequential random split actually
+    #labels = rng.randint(0, K, size=N)  # random init
+    # Contiguous equal-length blocks (sequential)
+    cuts = np.linspace(0, N, K + 1, dtype=int)
+    labels = np.repeat(np.arange(K), np.diff(cuts))
+
     U = [np.zeros((D, d)) for _ in range(K)] # init U to zero vectors
     w_kernel = _neighbor_kernel(s, lam if s > 0 else 0.0, set_middle_to_zero=False)
     seq_kernel = _neighbor_kernel(s, 1.0, set_middle_to_zero=False)

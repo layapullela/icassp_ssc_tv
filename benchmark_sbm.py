@@ -36,7 +36,7 @@ Probability sweep (sizes 50, 60, 90)
 Each observation matrix Y is Frobenius-normalised before clustering or
 tuning.  SSC-TV variants fix λ_z = 1 and tune the remaining penalties
 relative to it; λ_e21 stored in JSON is the pre-scale value and is
-multiplied by √N at call time (N = number of columns of Y).
+multiplied by sqrt(N) at call time (N = number of columns of Y).
 
 ADMM solvers are imported from the existing modules; SSC-TV max_iter is
 raised to 200 to match OSC.  TKSS uses alternating subspace / assignment
