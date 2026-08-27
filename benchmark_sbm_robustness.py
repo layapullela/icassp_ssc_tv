@@ -33,7 +33,7 @@ Usage
     python benchmark_sbm_robustness.py                        # all 5 axes
     python benchmark_sbm_robustness.py --axes num_clusters
     python benchmark_sbm_robustness.py --smoke                # fast sanity check
-    python benchmark_sbm_robustness.py --methods OSC SSC-TV-L21-PQ TKSS
+    python benchmark_sbm_robustness.py --methods OSC SSC-TV-L21-PQ TKSS DP-Y
     python benchmark_sbm_robustness.py --trials 3 --k-method eigengap --min-k 2
     python benchmark_sbm_robustness.py --plot-only --out-dir results/robustness
 """
@@ -370,7 +370,28 @@ def print_axis_summary(axis_name, rows, method_names):
             print("".join(cells), flush=True)
 
 
+def _row_score(row, score_fn):
+    if score_fn is None:
+        return row["ari"]
+    return score_fn(row)
+
+
 def plot_axis(axis_name, rows, method_names, out_dir):
+    _plot_axis_score(
+        axis_name, rows, method_names, out_dir,
+        score_fn=None, ylabel="ARI",
+        filename=f"robustness_{axis_name}.png",
+    )
+    _plot_axis_score(
+        axis_name, rows, method_names, out_dir,
+        score_fn=bench.row_sqrt_ari_nmi, ylabel=bench.SQRT_ARI_NMI_LABEL,
+        filename=f"robustness_{axis_name}_sqrt_ari_nmi.png",
+    )
+    _plot_axis_kerror(axis_name, rows, method_names, out_dir)
+
+
+def _plot_axis_score(axis_name, rows, method_names, out_dir, score_fn, ylabel,
+                     filename):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -391,7 +412,7 @@ def plot_axis(axis_name, rows, method_names, out_dir):
                 means, stds = [], []
                 for v in values:
                     a = _finite([
-                        r["ari"] for r in sub_rows
+                        _row_score(r, score_fn) for r in sub_rows
                         if r["sweep_value"] == v and r["method"] == m
                         and r["k_mode"] == k_mode and r["error"] == ""
                     ])
@@ -406,20 +427,30 @@ def plot_axis(axis_name, rows, method_names, out_dir):
                 title = f"{group}  ({title})"
             ax.set_title(title, fontsize=10)
             ax.set_xlabel(xlabel)
-            ax.set_ylabel("ARI")
+            ax.set_ylabel(ylabel)
             ax.set_ylim(-0.05, 1.05)
             ax.grid(True, alpha=0.3)
     handles, labels = axes[0][0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False,
-               bbox_to_anchor=(0.5, 1.02))
+    fig.legend(handles, labels, loc="upper center", ncol=min(len(labels), 5),
+               frameon=False, bbox_to_anchor=(0.5, 1.02))
     fig.suptitle(AXES[axis_name]["desc"], fontsize=10, y=1.06)
     fig.tight_layout()
-    out_path = Path(out_dir) / f"robustness_{axis_name}.png"
+    out_path = Path(out_dir) / filename
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Wrote {out_path}", flush=True)
 
-    # Second figure: |k_hat - k_true| vs sweep value (inferred-k only).
+
+def _plot_axis_kerror(axis_name, rows, method_names, out_dir):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    markers = ["o", "s", "D", "^", "v", "P", "X", "*"]
+    groups = sorted({r["sweep_group"] for r in rows}) or [""]
+    xlabel = AXES[axis_name]["xlabel"]
+
+    # |k_hat - k_true| vs sweep value (inferred-k only).
     fig, axes = plt.subplots(1, len(groups), figsize=(5.5 * len(groups), 4.2),
                              squeeze=False)
     for gi, group in enumerate(groups):
@@ -444,8 +475,8 @@ def plot_axis(axis_name, rows, method_names, out_dir):
         ax.set_ylabel("mean |k_hat - k_true|")
         ax.grid(True, alpha=0.3)
     handles, labels = axes[0][0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False,
-               bbox_to_anchor=(0.5, 1.05))
+    fig.legend(handles, labels, loc="upper center", ncol=min(len(labels), 5),
+               frameon=False, bbox_to_anchor=(0.5, 1.05))
     fig.tight_layout()
     out_path = Path(out_dir) / f"robustness_{axis_name}_kerror.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -511,12 +542,8 @@ def main():
             sub = [r for r in rows if r["axis"] == axis_name]
             if not sub:
                 continue
-            names = [m for m in args.methods if any(r["method"] == m for r in sub)]
-            # Prefer METHOD_SPECS order for all methods present when plotting
-            # the full merged file.
-            if not names:
-                names = [s["name"] for s in bench.METHOD_SPECS
-                         if any(r["method"] == s["name"] for r in sub)]
+            names = [s["name"] for s in bench.METHOD_SPECS
+                     if any(r["method"] == s["name"] for r in sub)]
             print_axis_summary(axis_name, sub, names)
             plot_axis(axis_name, sub, names, out_dir)
         return

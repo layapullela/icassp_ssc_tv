@@ -1,14 +1,15 @@
 """
-Protein-multimer subunit recovery: OSC vs SSC-TV-L21-PQ vs TKSS.
+Protein-multimer subunit recovery: DP-Y vs OSC vs SSC-TV-L21-PQ vs TKSS.
 
 Each Biological Assembly 1 is turned into a Cα contact graph (default 8 Å).
 Residues are ordered by chain, then sequence id — the same contiguous-block
 layout OSC / SSC-TV / TKSS assume.  Ground-truth labels are polymer chain IDs.
 Spectral clustering (OSC / SSC-TV) uses the true number of remaining chains k
 on W = |C| + |C|^T (OSC: |Z| + |Z|^T).  TKSS is given the same k and returns
-labels directly.  Pass ``--k none`` to drop that oracle k and infer it
-(``--k-method eigengap|ncut``); the true subunit labels are then used only
-to score ARI / NMI.
+labels directly.  DP-Y is the trivial baseline: the same contiguous DP NCut
+on the contact matrix Y itself (no coefficient matrix).  Pass ``--k none``
+to drop that oracle k and infer it (``--k-method eigengap|ncut``); the true
+subunit labels are then used only to score ARI / NMI.
 
 Tiny peptide-sized chains are dropped (default min length 20) so k matches
 the subunits we actually want to recover.  Large assemblies are uniformly
@@ -80,6 +81,7 @@ from visualize_contact_maps import (  # noqa: E402
 import benchmark_sbm as bench  # noqa: E402
 
 METHOD_CHOICES = [
+    "DP-Y",
     "OSC", "BDOSC", "SSC-TV", "SSC-TV-L21-PQ", "SSC-TV-L21-PQ-SparseC",
     "SSC-TV-L21-PQ-LowRankC",
     "SSC-TV-E1E21-L21-P", "SSC-TV-E1E21-L21-PQ", "TKSS",
@@ -219,7 +221,13 @@ def run_one(Y, labels, method_name, solver, k="oracle",
     run_k = bench.resolve_run_k(k, int(np.unique(labels).size))
     t0 = time.perf_counter()
     kind = bench.METHOD_KIND.get(method_name)
-    if kind == "tkss":
+    if kind == "dp_y":
+        pred = cluster_from_C(
+            Y, k=run_k, method=k_method, min_k=min_k, penalty=penalty,
+        )
+        if run_k is None:
+            run_k = int(np.unique(pred).size)
+    elif kind == "tkss":
         if run_k is None:
             run_k = estimate_k_from_data(
                 Y, method=k_method, min_k=min_k, penalty=penalty,
@@ -609,7 +617,25 @@ def eval_graphs(graphs, methods, split, writer, fh, rows, n_jobs, done, t_start,
     return done
 
 
+def _row_score(row, score_fn):
+    if score_fn is None:
+        return row["ari"]
+    return score_fn(row)
+
+
 def plot_results(rows, out_dir, method_names):
+    _plot_results_score(
+        rows, out_dir, method_names,
+        score_fn=None, ylabel="ARI", stem="ari",
+    )
+    _plot_results_score(
+        rows, out_dir, method_names,
+        score_fn=bench.row_sqrt_ari_nmi, ylabel=bench.SQRT_ARI_NMI_LABEL,
+        stem="sqrt_ari_nmi",
+    )
+
+
+def _plot_results_score(rows, out_dir, method_names, score_fn, ylabel, stem):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -625,13 +651,15 @@ def plot_results(rows, out_dir, method_names):
     _plot_oligomer_bars(
         axes[0], balanced, ssc_names,
         "Equal-size subunits (OSC / SSC-TV)",
+        score_fn=score_fn, ylabel=ylabel,
     )
     _plot_oligomer_bars(
         axes[1], unbalanced, method_names,
         "Unequal-size subunits (TKSS included)",
+        score_fn=score_fn, ylabel=ylabel,
     )
     fig.tight_layout()
-    path = out_dir / "ari_by_oligomer.png"
+    path = out_dir / f"{stem}_by_oligomer.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"Wrote {path}", flush=True)
@@ -645,28 +673,32 @@ def plot_results(rows, out_dir, method_names):
             pts = [r for r in sub if r["method"] == method]
             ax.scatter(
                 [r["n_residues"] for r in pts],
-                [r["ari"] for r in pts],
+                [_row_score(r, score_fn) for r in pts],
                 s=28, marker=markers[i % len(markers)], label=method, alpha=0.85,
             )
         ax.set_xlabel("Residues after filter / stride (N)")
-        ax.set_ylabel("ARI")
+        ax.set_ylabel(ylabel)
         ax.set_ylim(-0.05, 1.05)
         ax.set_title(title)
         ax.grid(True, alpha=0.3)
         ax.legend(frameon=False)
     fig.tight_layout()
-    path = out_dir / "ari_vs_n.png"
+    path = out_dir / f"{stem}_vs_n.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"Wrote {path}", flush=True)
 
-    _plot_paired(balanced, ssc_names, out_dir / "ari_paired_balanced.png",
-                 "Equal-size subunits")
-    _plot_paired(unbalanced, method_names, out_dir / "ari_paired_unbalanced.png",
-                 "Unequal-size subunits")
+    _plot_paired(
+        balanced, ssc_names, out_dir / f"{stem}_paired_balanced.png",
+        "Equal-size subunits", score_fn=score_fn, ylabel=ylabel,
+    )
+    _plot_paired(
+        unbalanced, method_names, out_dir / f"{stem}_paired_unbalanced.png",
+        "Unequal-size subunits", score_fn=score_fn, ylabel=ylabel,
+    )
 
 
-def _plot_oligomer_bars(ax, ok, method_names, title):
+def _plot_oligomer_bars(ax, ok, method_names, title, score_fn=None, ylabel="ARI"):
     if not method_names:
         ax.set_visible(False)
         return
@@ -676,7 +708,7 @@ def _plot_oligomer_bars(ax, ok, method_names, title):
         means, stds = [], []
         for lab in OLIGOMER_ORDER:
             a = np.array([
-                r["ari"] for r in ok
+                _row_score(r, score_fn) for r in ok
                 if r["method"] == method and r["oligomer_label"] == lab
             ], dtype=float)
             a = a[np.isfinite(a)]
@@ -686,14 +718,14 @@ def _plot_oligomer_bars(ax, ok, method_names, title):
         ax.bar(x + offset, means, width=width, yerr=stds, capsize=3, label=method)
     ax.set_xticks(x)
     ax.set_xticklabels(OLIGOMER_ORDER, rotation=25, ha="right")
-    ax.set_ylabel("ARI")
+    ax.set_ylabel(ylabel)
     ax.set_ylim(-0.05, 1.05)
     ax.set_title(title)
     ax.grid(True, axis="y", alpha=0.3)
     ax.legend(frameon=False)
 
 
-def _plot_paired(ok, method_names, path, title):
+def _plot_paired(ok, method_names, path, title, score_fn=None, ylabel="ARI"):
     import matplotlib.pyplot as plt
 
     pairs = [
@@ -710,7 +742,7 @@ def _plot_paired(ok, method_names, path, title):
     axes = axes.ravel()
     paired = {}
     for r in ok:
-        paired.setdefault(r["pdb_id"], {})[r["method"]] = r["ari"]
+        paired.setdefault(r["pdb_id"], {})[r["method"]] = _row_score(r, score_fn)
     for ax, (a_name, b_name) in zip(axes, pairs):
         xs, ys = [], []
         for vals in paired.values():
@@ -724,8 +756,8 @@ def _plot_paired(ok, method_names, path, title):
         ax.plot([-0.05, 1.05], [-0.05, 1.05], color="0.6", linewidth=1)
         ax.set_xlim(-0.05, 1.05)
         ax.set_ylim(-0.05, 1.05)
-        ax.set_xlabel(f"{a_name} ARI")
-        ax.set_ylabel(f"{b_name} ARI")
+        ax.set_xlabel(f"{a_name} {ylabel}")
+        ax.set_ylabel(f"{b_name} {ylabel}")
         ax.set_title(title)
         ax.set_aspect("equal")
         ax.grid(True, alpha=0.3)

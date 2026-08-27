@@ -194,6 +194,9 @@ E1E21_KW = E1E21_DEFAULTS
 OSC_KW = OSC_DEFAULTS
 
 METHOD_SPECS = [
+    # Trivial baseline: contiguous DP NCut on the observation Y itself
+    # (no self-expressiveness / no hyperparameters).
+    dict(name="DP-Y", kind="dp_y", solver=None, defaults={}),
     dict(name="OSC", kind="osc", solver=None, defaults=OSC_DEFAULTS),
     dict(name="BDOSC", kind="bdosc", solver=None, defaults=BDOSC_DEFAULTS),
     dict(name="SSC-TV", kind="ssc", solver=ssc_tv_admm, defaults=SSC_DEFAULTS),
@@ -253,6 +256,24 @@ def normalize_Y(Y):
     return Y / scale
 
 
+SQRT_ARI_NMI_LABEL = "√(ARI × NMI)"
+
+
+def sqrt_ari_nmi(ari, nmi):
+    """Geometric mean of ARI and NMI. Negative ARI is clipped to 0."""
+    try:
+        a, n = float(ari), float(nmi)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not (np.isfinite(a) and np.isfinite(n)):
+        return float("nan")
+    return float(np.sqrt(max(a, 0.0) * max(n, 0.0)))
+
+
+def row_sqrt_ari_nmi(row):
+    return sqrt_ari_nmi(row.get("ari"), row.get("nmi"))
+
+
 def _ssc_call_kwargs(kw, Y):
     """Fix ``lambda_z=1`` and scale ``lambda_e21`` by ``sqrt(N)`` (pre-scale in kw)."""
     call_kw = dict(kw)
@@ -302,6 +323,10 @@ def make_solver(spec, kwargs):
     kw = dict(kwargs)
     if spec["kind"] == "ssc":
         kw["lambda_z"] = LAMBDA_Z
+    if spec["kind"] == "dp_y":
+        def fn(Y):
+            return Y, None, None
+        return fn
     if spec["kind"] == "osc":
         def fn(Y, _kw=kw):
             Z = osc_exact(Y, **_osc_exact_kwargs(_kw))
@@ -347,7 +372,7 @@ def build_methods(overrides=None, max_iter=None, names=None):
         if spec["name"] not in wanted:
             continue
         kw = dict(spec["defaults"])
-        if max_iter is not None and spec["kind"] not in ("tkss",):
+        if max_iter is not None and spec["kind"] not in ("tkss", "dp_y"):
             kw["max_iter"] = max_iter
         extra = overrides.get(spec["name"], {})
         kw.update(extra)
@@ -867,7 +892,15 @@ def run_one(Y, labels, k, method_name, solver, outlier_mask,
     Y = normalize_Y(Y)
     t0 = time.perf_counter()
     kind = METHOD_KIND.get(method_name)
-    if kind == "tkss":
+    if kind == "dp_y":
+        pred = cluster_from_C(
+            Y, k=k, method=k_method, min_k=min_k, penalty=penalty,
+        )
+        elapsed = time.perf_counter() - t0
+        if k is None:
+            k = int(np.unique(pred).size)
+        scores = np.zeros(Y.shape[1])
+    elif kind == "tkss":
         if k is None:
             k = estimate_k_from_data(
                 Y, method=k_method, min_k=min_k, penalty=penalty,

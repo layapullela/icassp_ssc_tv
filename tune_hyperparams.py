@@ -489,7 +489,20 @@ def main():
     selected = {}
     t_start = time.perf_counter()
     storage_path = out_dir / "optuna.db"
-    for name in args.methods:
+    tune_names = [m for m in args.methods if m in SEARCH_SPACES]
+    skip_names = [m for m in args.methods if m not in SEARCH_SPACES]
+    if skip_names:
+        print(
+            f"Skipping Optuna for methods with no search space: "
+            f"{', '.join(skip_names)}",
+            flush=True,
+        )
+    if not tune_names:
+        print("No methods to tune; leaving existing hyperparameter files as-is.",
+              flush=True)
+        return
+
+    for name in tune_names:
         print(
             f"\n=== {name}  (Optuna TPE, {n_optuna_trials} trials × "
             f"{len(graphs)} graphs, max_iter={args.max_iter}) ===",
@@ -548,7 +561,7 @@ def main():
         "n_optuna_trials": n_optuna_trials,
         "n_startup_trials": args.n_startup_trials,
         "prior_weight": args.prior_weight,
-        "search_spaces": {m: SEARCH_SPACES[m] for m in args.methods},
+        "search_spaces": {m: SEARCH_SPACES[m] for m in tune_names},
         "y_normalization": "frobenius",
         "lambda_z": bench.LAMBDA_Z,
         "lambda_e21_scale": "sqrt(N)",
