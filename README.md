@@ -54,6 +54,8 @@ soft-threshold (prox of `τ ||·||_{2,1}`).
 | `ssc_tv.py` | SSC-TV | `‖E‖₁` | `‖P‖₁` | `‖Q‖₁` |
 | `ssc_tv_with_column_l21_on_columns_l1_on_rows.py` | SSC-TV-L21-P | `‖E‖₁` | `‖P‖_{2,1}` | `‖Q‖₁` |
 | `ssc_tv_with_l21_on_rows_and_columns.py` | SSC-TV-L21-PQ | `‖E‖₁` | `‖P‖_{2,1}` | `‖Q‖_{2,1}` |
+| `ssc_tv_row_col_l21_c_sparse.py` | SSC-TV-L21-PQ-SparseC | `‖E‖₁` | `‖P‖_{2,1}` | `‖Q‖_{2,1}` |
+| `ssc-tv-nuclear-norm.py` | SSC-TV-L21-PQ-LowRankC | `‖E‖₁` | `‖P‖_{2,1}` | `‖Q‖_{2,1}` |
 | `ssc_tv_e21_e1.py` | SSC-TV-E1E21 | `‖E‖₁ + ‖F‖_{2,1}` | `‖P‖₁` | `‖Q‖₁` |
 | `ssc_tv_e21_e1_and_l21_on_columns_l1_on_rows.py` | SSC-TV-E1E21-L21-P | `‖E‖₁ + ‖F‖_{2,1}` | `‖P‖_{2,1}` | `‖Q‖₁` |
 | `ssc_tv_e21_e1_and_l21_on_rows_and_columns.py` | SSC-TV-E1E21-L21-PQ | `‖E‖₁ + ‖F‖_{2,1}` | `‖P‖_{2,1}` | `‖Q‖_{2,1}` |
@@ -61,6 +63,11 @@ soft-threshold (prox of `τ ||·||_{2,1}`).
 The three non-hybrid files also expose `ssc_admm_nuc_tv_e21`, which swaps
 `‖E‖₁` for `‖E‖_{2,1}` only (no `F` split). That function is not in the
 benchmark.
+
+SSC-TV-L21-PQ-SparseC is SSC-TV-L21-PQ plus an extra `λ_c ‖C‖₁` term (split
+`S = C`; `ρ` is the ADMM penalty for that constraint and is not searched).
+SSC-TV-L21-PQ-LowRankC uses the same split with `λ_c ‖C‖_*` (singular-value
+thresholding) instead of entrywise soft-thresholding.
 
 Entrywise `‖·‖₁` uses `S_{γ/σ}`; column-group `‖·‖_{2,1}` uses
 `GroupSoft_{γ/σ}`.

@@ -6,7 +6,8 @@ from the other SSC-TV variants.
 
 import warnings
 import numpy as np
-from sklearn.cluster import SpectralClustering
+
+from ssc_tv import cluster_from_C
 
 warnings.filterwarnings('ignore', message='.*matmul.*', category=RuntimeWarning)
 
@@ -27,6 +28,10 @@ def block_soft_threshold_cols(M, tau):
     scale = np.maximum(1.0 - tau / np.maximum(col_norms, 1e-12), 0.0)
     return scale * M
 
+def block_soft_threshold_rows(M, tau):
+    norms = np.linalg.norm(M, axis=1, keepdims=True)
+    scale = np.maximum(1.0 - tau / np.maximum(norms, 1e-12), 0.0)
+    return scale * M
 
 def finite_diff_matrix(N):
     """First-order finite-difference operator D ∈ ℝ^{(N-1)×N}."""
@@ -68,6 +73,7 @@ def ssc_admm_nuc_tv(
     X, C, E : ndarrays
     """
     n, N = Y.shape
+    normfY = np.linalg.norm(Y, 'fro')
 
     # ── Precompute static quantities ──────────────────────────────────────────
     D = finite_diff_matrix(N)                 # (N-1, N)
@@ -91,6 +97,7 @@ def ssc_admm_nuc_tv(
 
     for it in range(max_iter):
         X_prev = X
+        C_prev = C
 
         # 1. X-update
         C_off = C - np.diag(np.diag(C))
@@ -103,10 +110,10 @@ def ssc_admm_nuc_tv(
         C = V @ ((V.T @ RHS_C @ V) / denom) @ V.T
         np.fill_diagonal(C, 0.0)
 
-        # 3-4. P- and Q-updates: column-wise group soft threshold (L2,1)
+        # 3-4. P- and Q-updates: group soft threshold (L2,1)
         DC  = D @ C
         CDt = C @ D.T
-        P = block_soft_threshold_cols(DC  + Pi_P / sigma, gamma / sigma)
+        P = block_soft_threshold_rows(DC  + Pi_P / sigma, gamma / sigma)
         Q = block_soft_threshold_cols(CDt + Pi_Q / sigma, gamma / sigma)
 
         # 5. E-update
@@ -118,15 +125,25 @@ def ssc_admm_nuc_tv(
         Pi_P   += sigma * (DC  - P)
         Pi_Q   += sigma * (CDt - Q)
 
-        # Convergence check
+        # Relative convergence (matched to OSC: residuals / ‖Y‖_F)
         primal_res = max(
             np.linalg.norm(X   - C_off, 'fro'),
             np.linalg.norm(DC  - P,     'fro'),
             np.linalg.norm(CDt - Q,     'fro'),
-        )
-        dual_res = mu * np.linalg.norm(X - X_prev, 'fro')
-        if primal_res < tol and dual_res < tol:
+        ) / normfY
+
+        dual_change = max(
+            np.linalg.norm(C - C_prev, 'fro') * sigma,
+            np.linalg.norm(X - X_prev, 'fro') * mu,
+        ) / normfY
+
+        if primal_res < tol and dual_change < tol * 1e-2:
             break
+
+        if dual_change < tol * 1e-2:
+            mu_max = 10.0
+            mu    = min(mu_max, 1.1 * mu)
+            sigma = min(mu_max, 1.1 * sigma)
 
     return X, C, E
 
@@ -212,7 +229,7 @@ def ssc_admm_nuc_tv_e21(
         # 3-4. P- and Q-updates: column-wise group soft threshold (L2,1)
         DC  = D @ C
         CDt = C @ D.T
-        P = block_soft_threshold_cols(DC  + Pi_P / sigma, gamma / sigma)
+        P = block_soft_threshold_rows(DC  + Pi_P / sigma, gamma / sigma)
         Q = block_soft_threshold_cols(CDt + Pi_Q / sigma, gamma / sigma)
 
         # 5. E-update — column-wise block soft-threshold (L2,1 proximal step)
@@ -235,33 +252,6 @@ def ssc_admm_nuc_tv_e21(
             break
 
     return X, C, E
-
-
-# ── Clustering ────────────────────────────────────────────────────────────────
-
-def cluster_from_C(C, k=None, k_max=None):
-    """Spectral clustering on the symmetric affinity W = |C| + |C|^T.
-
-    If ``k`` is None it is estimated with the eigengap heuristic on the
-    symmetrically-normalised affinity D^{-½} W D^{-½}: k is the index of the
-    largest drop between consecutive (descending) eigenvalues, clipped to
-    ``[1, k_max]``.  ``k_max`` defaults to N // 20.
-    """
-    W = np.abs(C) + np.abs(C.T)
-
-    if k is None:
-        if k_max is None:
-            k_max = max(1, C.shape[0] // 20)
-        d = np.maximum(W.sum(axis=1), 1e-12)
-        d_inv_sqrt = 1.0 / np.sqrt(d)
-        W_norm = d_inv_sqrt[:, None] * W * d_inv_sqrt[None, :]
-        eigvals = np.linalg.eigvalsh(W_norm)[::-1]   # descending
-        gaps = eigvals[:-1] - eigvals[1:]
-        k = int(np.clip(np.argmax(gaps) + 1, 1, k_max))
-
-    sc = SpectralClustering(n_clusters=k, affinity='precomputed',
-                            assign_labels='kmeans', random_state=0)
-    return sc.fit_predict(W)
 
 
 # ── Synthetic sanity check ──────────────────────────────────────────────────

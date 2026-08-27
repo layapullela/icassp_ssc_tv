@@ -3,7 +3,8 @@ OSC impelmentation, translated to python from https://github.com/sjtrny/SubKit/b
 """
 
 import numpy as np
-from sklearn.cluster import SpectralClustering
+
+from ssc_tv import cluster_from_C
 
 def solve_l1(x, lambda_1):
     # soft thresholding
@@ -34,7 +35,7 @@ def norm_l1l2(x):
     return L
 
 
-def osc_exact(X, lambda_1, lambda_2, mu=None, diagconstraint=False, max_iter=200):
+def osc_exact(X, lambda_1, lambda_2, mu=None, diagconstraint=True, max_iter=200):
     X = np.asarray(X, dtype=float)
 
     if diagconstraint is None:
@@ -159,23 +160,13 @@ def osc_exact(X, lambda_1, lambda_2, mu=None, diagconstraint=False, max_iter=200
         E_prev = E.copy()
         J_prev = J.copy()
 
+        #print("mu: ", mu)
+
     return Z
 
 
-def cluster_from_Z(Z, k=None, k_max=None):
-    """Spectral clustering on W = |Z| + |Z|^T (OSC paper, Algorithm 3)."""
-    W = np.abs(Z) + np.abs(Z.T)
-
-    if k is None:
-        if k_max is None:
-            k_max = max(1, Z.shape[0] // 20)
-        d = np.maximum(W.sum(axis=1), 1e-12)
-        d_inv_sqrt = 1.0 / np.sqrt(d)
-        W_norm = d_inv_sqrt[:, None] * W * d_inv_sqrt[None, :]
-        eigvals = np.linalg.eigvalsh(W_norm)[::-1]
-        gaps = eigvals[:-1] - eigvals[1:]
-        k = int(np.clip(np.argmax(gaps) + 1, 1, k_max))
-
-    sc = SpectralClustering(n_clusters=k, affinity="precomputed",
-                            assign_labels="kmeans", random_state=0)
-    return sc.fit_predict(W)
+def cluster_from_Z(Z, k=None, k_max=None, method='eigengap', min_k=2, penalty=0.0):
+    """Contiguous DP Normalized Cut on W = |Z| + |Z|^T."""
+    return cluster_from_C(
+        Z, k=k, k_max=k_max, method=method, min_k=min_k, penalty=penalty,
+    )

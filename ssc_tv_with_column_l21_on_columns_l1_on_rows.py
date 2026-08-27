@@ -6,7 +6,8 @@ from the other SSC-TV variants.
 
 import warnings
 import numpy as np
-from sklearn.cluster import SpectralClustering
+
+from ssc_tv import cluster_from_C
 
 warnings.filterwarnings('ignore', message='.*matmul.*', category=RuntimeWarning)
 
@@ -128,6 +129,11 @@ def ssc_admm_nuc_tv(
         if primal_res < tol and dual_res < tol:
             break
 
+        mu_max, gamma_0 = 10.0, 1.1
+        gamma_step = gamma_0 if max(primal_res, dual_res) < tol else 1.0
+        mu = min(mu_max, gamma_step * mu)
+        sigma = min(mu_max, gamma_step * sigma)
+
     return X, C, E
 
 
@@ -235,33 +241,6 @@ def ssc_admm_nuc_tv_e21(
             break
 
     return X, C, E
-
-
-# ── Clustering ────────────────────────────────────────────────────────────────
-
-def cluster_from_C(C, k=None, k_max=None):
-    """Spectral clustering on the symmetric affinity W = |C| + |C|^T.
-
-    If ``k`` is None it is estimated with the eigengap heuristic on the
-    symmetrically-normalised affinity D^{-½} W D^{-½}: k is the index of the
-    largest drop between consecutive (descending) eigenvalues, clipped to
-    ``[1, k_max]``.  ``k_max`` defaults to N // 20.
-    """
-    W = np.abs(C) + np.abs(C.T)
-
-    if k is None:
-        if k_max is None:
-            k_max = max(1, C.shape[0] // 20)
-        d = np.maximum(W.sum(axis=1), 1e-12)
-        d_inv_sqrt = 1.0 / np.sqrt(d)
-        W_norm = d_inv_sqrt[:, None] * W * d_inv_sqrt[None, :]
-        eigvals = np.linalg.eigvalsh(W_norm)[::-1]   # descending
-        gaps = eigvals[:-1] - eigvals[1:]
-        k = int(np.clip(np.argmax(gaps) + 1, 1, k_max))
-
-    sc = SpectralClustering(n_clusters=k, affinity='precomputed',
-                            assign_labels='kmeans', random_state=0)
-    return sc.fit_predict(W)
 
 
 # ── Synthetic sanity check ──────────────────────────────────────────────────

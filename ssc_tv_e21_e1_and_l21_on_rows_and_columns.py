@@ -126,6 +126,11 @@ def ssc_admm_nuc_tv_e1_e21(
         if primal_res < tol and dual_res < tol:
             break
 
+        mu_max, gamma_0 = 10.0, 1.1
+        gamma_step = gamma_0 if max(primal_res, dual_res) < tol else 1.0
+        mu = min(mu_max, gamma_step * mu)
+        sigma = min(mu_max, gamma_step * sigma)
+
     return X, C, E, F
 
 

@@ -1,5 +1,7 @@
 import numpy as np
 
+from ssc_tv import estimate_k_from_data
+
 
 def compute_subspace_distance_sq(X, U):
     """Computes the squared distance from each point in X to subspace U.
@@ -123,12 +125,21 @@ def tkss(X, K, d, lam=1.0, s=1, max_iter=50, random_state=None):
     return U, labels
 
 
-def tkss_cluster(X, k, d=1, lam=1.0, s=1, max_iter=50, random_state=None):
+def tkss_cluster(X, k=None, d=1, lam=1.0, s=1, max_iter=50, random_state=None,
+                 k_max=None, method='eigengap', min_k=2, penalty=0.0):
     """Fit TKSS and return labels plus per-point residual.
 
     Residual is the squared distance to the assigned subspace, used as an
     outlier score in the SBM case-4 protocol (higher = more outlier-like).
+
+    If ``k`` is None it is inferred from the observation matrix ``X`` via
+    ``ssc_tv.estimate_k_from_data`` (``method='eigengap'`` or ``'ncut'``).
     """
+    if k is None:
+        k = estimate_k_from_data(
+            X, k_max=k_max, min_k=min_k, method=method, penalty=penalty,
+        )
+    k = int(k)
     U, labels = tkss(
         X, K=k, d=d, lam=lam, s=s, max_iter=max_iter, random_state=random_state,
     )

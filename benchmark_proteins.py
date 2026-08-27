@@ -1,12 +1,14 @@
 """
-Protein-multimer subunit recovery: OSC vs SSC-TV-E1E21 vs TKSS.
+Protein-multimer subunit recovery: OSC vs SSC-TV-L21-PQ vs TKSS.
 
 Each Biological Assembly 1 is turned into a Cα contact graph (default 8 Å).
 Residues are ordered by chain, then sequence id — the same contiguous-block
 layout OSC / SSC-TV / TKSS assume.  Ground-truth labels are polymer chain IDs.
 Spectral clustering (OSC / SSC-TV) uses the true number of remaining chains k
 on W = |C| + |C|^T (OSC: |Z| + |Z|^T).  TKSS is given the same k and returns
-labels directly.
+labels directly.  Pass ``--k none`` to drop that oracle k and infer it
+(``--k-method eigengap|ncut``); the true subunit labels are then used only
+to score ARI / NMI.
 
 Tiny peptide-sized chains are dropped (default min length 20) so k matches
 the subunits we actually want to recover.  Large assemblies are uniformly
@@ -14,13 +16,24 @@ subsampled to --max-n residues so the N×N ADMM stays tractable.
 
 Protocol
 --------
-Assemblies are split 50/50 *within each oligomer class* (seeded).  Each
-contact matrix Y is Frobenius-normalised.  OSC, SSC-TV-E1E21, and TKSS
-hyperparameters are selected on the tune half by mean ARI with Optuna TPE
-over log-uniform [1e-5, 10] (TKSS: λ same range; s, d integer).  SSC-TV
-λ_z is fixed at 1; λ_e21 is tuned pre-scale and multiplied by √N at solve
-time.  The held-out half is the only number used to compare which model
-fits protein contact graphs.
+Assemblies are split 30/70 *within each oligomer class* (seeded): 30% for
+hyperparameter search, 70% held-out test.  Each contact matrix Y has
+columns scaled to unit ℓ2 norm.  OSC, SSC-TV-L21-PQ, and TKSS
+hyperparameters are selected on the tune split by mean ARI with Optuna TPE
+(log-uniform [1e-4, 10]; TKSS: λ same range; s, d integer).  SSC-TV λ_z is
+fixed at 1.  SSC-TV-L21-PQ tunes λ_e and γ (no λ_e21).  The held-out split
+is the only number used to report protein contact-graph recovery.  Pass
+``--params`` to reuse a previous split / already-tuned methods and search
+only the methods that are still missing.
+
+Reporting
+---------
+TKSS is initialised to K equal-length contiguous blocks, so equal-size
+subunits (chain lengths differ by at most 1 residue) match that init and
+are not a fair TKSS test.  Printed tables and plots therefore split:
+
+  * equal-size subunits  — OSC / SSC-TV only
+  * unequal-size subunits — OSC / SSC-TV plus TKSS as a comparison
 
 Usage
 -----
@@ -28,6 +41,9 @@ Usage
     python benchmark_proteins.py --out-dir results/proteins_tuned
     python benchmark_proteins.py --n-trials 40 --out-dir results/proteins_optuna
     python benchmark_proteins.py --params results/proteins_tuned/best_hyperparams.json
+    python benchmark_proteins.py --k none --k-method eigengap --min-k 2 \\
+        --tune-frac 0.3 --methods OSC SSC-TV-L21-PQ TKSS \\
+        --out-dir results/proteins-unk-k-eigengap-l21pq
 """
 
 from __future__ import annotations
@@ -53,7 +69,7 @@ if str(ROOT / "protein_data") not in sys.path:
     sys.path.insert(0, str(ROOT / "protein_data"))
 
 from osc import cluster_from_Z  # noqa: E402
-from ssc_tv import cluster_from_C  # noqa: E402
+from ssc_tv import cluster_from_C, estimate_k_from_data  # noqa: E402
 from visualize_contact_maps import (  # noqa: E402
     contact_adjacency,
     extract_ca_coords,
@@ -63,32 +79,51 @@ from visualize_contact_maps import (  # noqa: E402
 
 import benchmark_sbm as bench  # noqa: E402
 
-METHOD_CHOICES = ["OSC", "SSC-TV", "SSC-TV-E1E21", "TKSS"]
-DEFAULT_METHODS = ["OSC", "SSC-TV-E1E21", "TKSS"]
+METHOD_CHOICES = [
+    "OSC", "BDOSC", "SSC-TV", "SSC-TV-L21-PQ", "SSC-TV-L21-PQ-SparseC",
+    "SSC-TV-L21-PQ-LowRankC",
+    "SSC-TV-E1E21-L21-P", "SSC-TV-E1E21-L21-PQ", "TKSS",
+]
+DEFAULT_METHODS = ["OSC", "SSC-TV-L21-PQ", "TKSS"]
 OLIGOMER_ORDER = [
     "dimer", "trimer", "tetramer", "pentamer", "hexamer", "heptamer", "octamer",
 ]
 SPLIT_SEED = 0
-TUNE_FRAC = 0.5
-TUNE_MAX_ITER = 80
+TUNE_FRAC = 0.3
+TUNE_MAX_ITER = 200
 N_TRIALS = 40
 N_STARTUP_TRIALS = 10
 
-# Log-uniform ranges.  λ_z is fixed at 1 (not searched); λ_e21 is the pre-√N scale.
-PARAM_RANGE = (1e-5, 10.0)
+# Log-uniform ranges.  λ_z is fixed at 1 (not searched).
+# E1E21 variants also tune λ_e21 (pre-√N scale); L21-PQ tunes λ_e and γ
+# with γ floored at 1e-2; L21-PQ-SparseC additionally tunes λ_c (||C||_1);
+# L21-PQ-LowRankC tunes λ_c as the nuclear-norm weight (||C||_*).
+# BDOSC tunes λ1/λ2 (like OSC) plus ADMM γ₁ and growth factor p.
+PARAM_RANGE = (1e-3, 10.0)
+GAMMA_RANGE = (1e-2, 10.0)
 SEARCH_SPACES = {
     "OSC": {
         "lambda1": PARAM_RANGE,
         "lambda2": PARAM_RANGE,
     },
+    "BDOSC": {
+        "lambda1": PARAM_RANGE,
+        "lambda2": PARAM_RANGE,
+        "gamma1": PARAM_RANGE,
+        "p": (1.01, 1.5),
+    },
     "SSC-TV": {
         "lambda_e": PARAM_RANGE,
-        "gamma": PARAM_RANGE,
+        "gamma": GAMMA_RANGE,
+    },
+    "SSC-TV-L21-PQ": {
+        "lambda_e": PARAM_RANGE,
+        "gamma": GAMMA_RANGE,
     },
     "SSC-TV-E1E21": {
         "lambda_e1": PARAM_RANGE,
         "lambda_e21": PARAM_RANGE,
-        "gamma": PARAM_RANGE,
+        "gamma": GAMMA_RANGE,
     },
     "TKSS": {
         "lam": PARAM_RANGE,
@@ -96,12 +131,20 @@ SEARCH_SPACES = {
         "d": (1, 6),
     },
 }
+SEARCH_SPACES["SSC-TV-L21-PQ-SparseC"] = {
+    "lambda_e": PARAM_RANGE,
+    "lambda_c": PARAM_RANGE,
+    "gamma": GAMMA_RANGE,
+}
+SEARCH_SPACES["SSC-TV-L21-PQ-LowRankC"] = SEARCH_SPACES["SSC-TV-L21-PQ-SparseC"]
+SEARCH_SPACES["SSC-TV-E1E21-L21-P"] = SEARCH_SPACES["SSC-TV-E1E21"]
+SEARCH_SPACES["SSC-TV-E1E21-L21-PQ"] = SEARCH_SPACES["SSC-TV-E1E21"]
 
 INT_SEARCH_KEYS = {"s", "d"}
 
 FIELDNAMES = [
     "split", "pdb_id", "oligomer_label", "n_subunits_meta", "n_chains",
-    "n_residues", "n_residues_raw", "stride", "chain_sizes",
+    "k_hat", "n_residues", "n_residues_raw", "stride", "chain_sizes",
     "cutoff", "method", "ari", "nmi", "seconds", "error",
 ]
 
@@ -163,26 +206,53 @@ def encode_labels(chain_ids):
     return labels, sizes
 
 
-def cluster_coeff(coeff, k, method_name):
-    if method_name == "OSC":
-        return cluster_from_Z(coeff, k=k)
-    return cluster_from_C(coeff, k=k)
+def cluster_coeff(coeff, k, method_name, k_method="eigengap", min_k=2, penalty=0.0):
+    kw = dict(k=k, method=k_method, min_k=min_k, penalty=penalty)
+    if method_name in ("OSC", "BDOSC"):
+        return cluster_from_Z(coeff, **kw)
+    return cluster_from_C(coeff, **kw)
 
 
-def run_one(Y, labels, method_name, solver):
+def run_one(Y, labels, method_name, solver, k="oracle",
+            k_method="eigengap", min_k=2, penalty=0.0):
     Y = bench.normalize_Y(Y)
-    k = int(np.unique(labels).size)
+    run_k = bench.resolve_run_k(k, int(np.unique(labels).size))
     t0 = time.perf_counter()
-    if bench.METHOD_KIND.get(method_name) == "tkss":
-        pred, _residual = solver(Y, k)
+    kind = bench.METHOD_KIND.get(method_name)
+    if kind == "tkss":
+        if run_k is None:
+            run_k = estimate_k_from_data(
+                Y, method=k_method, min_k=min_k, penalty=penalty,
+            )
+        pred, _residual = solver(Y, run_k)
+    elif kind == "bdosc":
+        if run_k is None:
+            run_k = estimate_k_from_data(
+                Y, method=k_method, min_k=min_k, penalty=penalty,
+            )
+        coeff, _E, _F = solver(Y, run_k)
+        pred = cluster_coeff(
+            coeff, run_k, method_name,
+            k_method=k_method, min_k=min_k, penalty=penalty,
+        )
     else:
         coeff, _E, _F = solver(Y)
-        pred = cluster_coeff(coeff, k, method_name)
+        pred = cluster_coeff(
+            coeff, run_k, method_name,
+            k_method=k_method, min_k=min_k, penalty=penalty,
+        )
+        if run_k is None:
+            run_k = int(np.unique(pred).size)
     elapsed = time.perf_counter() - t0
+    ari = float(adjusted_rand_score(labels, pred))
+    # NaN from divide-by-zero / degenerate partitions → -1 (Optuna moves away).
+    if not np.isfinite(ari):
+        ari = -1.0
     return {
-        "ari": float(adjusted_rand_score(labels, pred)),
+        "ari": ari,
         "nmi": float(normalized_mutual_info_score(labels, pred)),
         "seconds": elapsed,
+        "k_hat": int(run_k),
         "error": "",
     }
 
@@ -247,23 +317,33 @@ def load_assembly(meta, datadir, cutoff, min_chain_len, max_n):
         })
     except Exception as exc:
         rec["error"] = f"{type(exc).__name__}: {exc}"
-        traceback.print_exc()
+        # Expected skip: peptide filtering / stride emptied all but one chain.
+        if "fewer than 2" in str(exc):
+            print(f"  skip {rec['pdb_id']}: {exc}", flush=True)
+        else:
+            traceback.print_exc()
     return rec
 
 
-def mean_ari(solver, method_name, graphs):
+def mean_ari(solver, method_name, graphs, k="oracle",
+             k_method="eigengap", min_k=2, penalty=0.0):
     aris = []
     for g in graphs:
         if g["error"] or g["Y"] is None:
             aris.append(float("nan"))
             continue
         try:
-            rec = run_one(g["Y"], g["labels"], method_name, solver)
+            rec = run_one(
+                g["Y"], g["labels"], method_name, solver, k=k,
+                k_method=k_method, min_k=min_k, penalty=penalty,
+            )
             aris.append(rec["ari"])
         except Exception:
             aris.append(float("nan"))
     a = np.array(aris, dtype=float)
-    return float(np.nanmean(a)) if np.isfinite(a).any() else float("nan")
+    if not np.isfinite(a).any():
+        return -1.0
+    return float(np.nanmean(a))
 
 
 def spec_by_name(name):
@@ -293,7 +373,8 @@ def default_search_params(name):
     return out
 
 
-def eval_config(name, extra, graphs, max_iter):
+def eval_config(name, extra, graphs, max_iter, k="oracle",
+                k_method="eigengap", min_k=2, penalty=0.0):
     spec = spec_by_name(name)
     kw = dict(spec["defaults"])
     if spec["kind"] != "tkss":
@@ -302,11 +383,15 @@ def eval_config(name, extra, graphs, max_iter):
     if spec["kind"] == "ssc":
         kw["lambda_z"] = bench.LAMBDA_Z
     solver = bench.make_solver(spec, kw)
-    return mean_ari(solver, name, graphs)
+    return mean_ari(
+        solver, name, graphs, k=k,
+        k_method=k_method, min_k=min_k, penalty=penalty,
+    )
 
 
 def tune_method_optuna(
     name, graphs, max_iter, n_trials, n_startup, seed, storage_path, resume,
+    k="oracle", k_method="eigengap", min_k=2, penalty=0.0,
 ):
     ok = [g for g in graphs if not g["error"] and g["Y"] is not None]
     if name not in SEARCH_SPACES:
@@ -352,7 +437,11 @@ def tune_method_optuna(
 
     def objective(trial):
         extra = suggest_params(trial, name)
-        ari = eval_config(name, extra, ok, max_iter)
+        ari = eval_config(
+            name, extra, ok, max_iter, k=k,
+            k_method=k_method, min_k=min_k, penalty=penalty,
+        )
+        # NaN ARI (e.g. divide-by-zero) → -1 so Optuna moves away.
         if not np.isfinite(ari):
             return -1.0
         return ari
@@ -394,6 +483,42 @@ def tune_method_optuna(
     return best, rows
 
 
+def parse_chain_sizes(value):
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return [int(x) for x in value]
+    return [int(x) for x in str(value).split()]
+
+
+def equal_size_subunits(sizes):
+    """True when every chain length is the same up to a 1-residue remainder.
+
+    That is the partition TKSS uses at initialisation (equal-length contiguous
+    blocks), so those assemblies are excluded from TKSS accuracy.
+    """
+    sizes = [int(s) for s in sizes]
+    if len(sizes) < 2:
+        return False
+    return max(sizes) - min(sizes) <= 1
+
+
+def row_equal_size(row):
+    return equal_size_subunits(parse_chain_sizes(row.get("chain_sizes", "")))
+
+
+def ssc_method_names(method_names):
+    """OSC / SSC-TV variants; TKSS is reported only on unequal-size assemblies."""
+    return [m for m in method_names if m != "TKSS"]
+
+
+def split_by_subunit_balance(rows):
+    balanced, unbalanced = [], []
+    for r in rows:
+        (balanced if row_equal_size(r) else unbalanced).append(r)
+    return balanced, unbalanced
+
+
 def rows_for_eval(rows, split="test"):
     ok = [r for r in rows if r.get("error", "") == ""]
     tagged = [r for r in ok if r.get("split")]
@@ -418,7 +543,8 @@ def graph_to_row_base(g, split, cutoff):
     }
 
 
-def eval_graphs(graphs, methods, split, writer, fh, rows, n_jobs, done, t_start, cutoff):
+def eval_graphs(graphs, methods, split, writer, fh, rows, n_jobs, done, t_start,
+                cutoff, k="oracle", k_method="eigengap", min_k=2, penalty=0.0):
     for g in graphs:
         rec_base = graph_to_row_base(g, split, cutoff)
         if g["error"] or g["Y"] is None:
@@ -426,6 +552,7 @@ def eval_graphs(graphs, methods, split, writer, fh, rows, n_jobs, done, t_start,
                 rec = dict(rec_base)
                 rec.update({
                     "method": method_name,
+                    "k_hat": "",
                     "ari": float("nan"),
                     "nmi": float("nan"),
                     "seconds": float("nan"),
@@ -440,20 +567,24 @@ def eval_graphs(graphs, methods, split, writer, fh, rows, n_jobs, done, t_start,
         print(
             f"{split:4s}  {g['pdb_id']}  {g['oligomer_label']:<10s}  "
             f"N={g['n_residues']} (raw {g['n_residues_raw']}, stride {g['stride']})  "
-            f"k={g['n_chains']}  sizes={g['chain_sizes']}",
+            f"k_true={g['n_chains']}  sizes={g['chain_sizes']}",
             flush=True,
         )
         for method_name, solver in methods:
             rec = dict(rec_base)
             rec.update({
                 "method": method_name,
+                "k_hat": "",
                 "ari": float("nan"),
                 "nmi": float("nan"),
                 "seconds": float("nan"),
                 "error": "",
             })
             try:
-                rec.update(run_one(g["Y"], g["labels"], method_name, solver))
+                rec.update(run_one(
+                    g["Y"], g["labels"], method_name, solver, k=k,
+                    k_method=k_method, min_k=min_k, penalty=penalty,
+                ))
             except Exception as exc:
                 rec["error"] = f"{type(exc).__name__}: {exc}"
                 traceback.print_exc()
@@ -471,7 +602,8 @@ def eval_graphs(graphs, methods, split, writer, fh, rows, n_jobs, done, t_start,
             else:
                 status = (
                     f"[{done}/{n_jobs}] {split} {g['pdb_id']}  "
-                    f"{method_name:16s}  ARI={rec['ari']:.3f}  {rec['seconds']:.1f}s"
+                    f"{method_name:16s}  k_hat={rec.get('k_hat', '')}  "
+                    f"ARI={rec['ari']:.3f}  {rec['seconds']:.1f}s"
                 )
             print(f"{status}   ({elapsed:.0f}s elapsed, ETA {eta:.0f}s)", flush=True)
     return done
@@ -485,8 +617,59 @@ def plot_results(rows, out_dir, method_names):
     ok = rows_for_eval(rows, split="test")
     if not ok:
         return
+    balanced, unbalanced = split_by_subunit_balance(ok)
+    ssc_names = ssc_method_names(method_names)
+    markers = ["o", "s", "D", "^", "v", "P"]
 
-    fig, ax = plt.subplots(figsize=(8.4, 4.6))
+    fig, axes = plt.subplots(1, 2, figsize=(12.6, 4.6), sharey=True)
+    _plot_oligomer_bars(
+        axes[0], balanced, ssc_names,
+        "Equal-size subunits (OSC / SSC-TV)",
+    )
+    _plot_oligomer_bars(
+        axes[1], unbalanced, method_names,
+        "Unequal-size subunits (TKSS included)",
+    )
+    fig.tight_layout()
+    path = out_dir / "ari_by_oligomer.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"Wrote {path}", flush=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.8), sharey=True)
+    for ax, sub, names, title in (
+        (axes[0], balanced, ssc_names, "Equal-size subunits"),
+        (axes[1], unbalanced, method_names, "Unequal-size subunits"),
+    ):
+        for i, method in enumerate(names):
+            pts = [r for r in sub if r["method"] == method]
+            ax.scatter(
+                [r["n_residues"] for r in pts],
+                [r["ari"] for r in pts],
+                s=28, marker=markers[i % len(markers)], label=method, alpha=0.85,
+            )
+        ax.set_xlabel("Residues after filter / stride (N)")
+        ax.set_ylabel("ARI")
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+        ax.legend(frameon=False)
+    fig.tight_layout()
+    path = out_dir / "ari_vs_n.png"
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"Wrote {path}", flush=True)
+
+    _plot_paired(balanced, ssc_names, out_dir / "ari_paired_balanced.png",
+                 "Equal-size subunits")
+    _plot_paired(unbalanced, method_names, out_dir / "ari_paired_unbalanced.png",
+                 "Unequal-size subunits")
+
+
+def _plot_oligomer_bars(ax, ok, method_names, title):
+    if not method_names:
+        ax.set_visible(False)
+        return
     x = np.arange(len(OLIGOMER_ORDER))
     width = 0.35 if len(method_names) == 2 else 0.8 / max(len(method_names), 1)
     for i, method in enumerate(method_names):
@@ -502,84 +685,68 @@ def plot_results(rows, out_dir, method_names):
         offset = (i - (len(method_names) - 1) / 2) * width
         ax.bar(x + offset, means, width=width, yerr=stds, capsize=3, label=method)
     ax.set_xticks(x)
-    ax.set_xticklabels(OLIGOMER_ORDER)
+    ax.set_xticklabels(OLIGOMER_ORDER, rotation=25, ha="right")
     ax.set_ylabel("ARI")
     ax.set_ylim(-0.05, 1.05)
-    ax.set_title("Held-out subunit recovery from Cα contact graphs")
+    ax.set_title(title)
     ax.grid(True, axis="y", alpha=0.3)
     ax.legend(frameon=False)
-    fig.tight_layout()
-    path = out_dir / "ari_by_oligomer.png"
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print(f"Wrote {path}", flush=True)
 
-    fig, ax = plt.subplots(figsize=(7.2, 4.8))
-    markers = ["o", "s", "D", "^", "v", "P"]
-    for i, method in enumerate(method_names):
-        sub = [r for r in ok if r["method"] == method]
-        ax.scatter(
-            [r["n_residues"] for r in sub],
-            [r["ari"] for r in sub],
-            s=28, marker=markers[i % len(markers)], label=method, alpha=0.85,
-        )
-    ax.set_xlabel("Residues after filter / stride (N)")
-    ax.set_ylabel("ARI")
-    ax.set_ylim(-0.05, 1.05)
-    ax.set_title("ARI vs assembly size")
-    ax.grid(True, alpha=0.3)
-    ax.legend(frameon=False)
-    fig.tight_layout()
-    path = out_dir / "ari_vs_n.png"
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print(f"Wrote {path}", flush=True)
+
+def _plot_paired(ok, method_names, path, title):
+    import matplotlib.pyplot as plt
 
     pairs = [
         (method_names[i], method_names[j])
         for i in range(len(method_names))
         for j in range(i + 1, len(method_names))
     ]
-    if pairs:
-        n_pairs = len(pairs)
-        fig, axes = plt.subplots(
-            1, n_pairs, figsize=(5.4 * n_pairs, 5.4), squeeze=False,
-        )
-        axes = axes.ravel()
-        paired = {}
-        for r in ok:
-            paired.setdefault(r["pdb_id"], {})[r["method"]] = r["ari"]
-        for ax, (a_name, b_name) in zip(axes, pairs):
-            xs, ys = [], []
-            for vals in paired.values():
-                if a_name in vals and b_name in vals:
-                    xs.append(vals[a_name])
-                    ys.append(vals[b_name])
-            if not xs:
-                ax.set_visible(False)
-                continue
-            ax.scatter(xs, ys, s=28, alpha=0.85)
-            ax.plot([-0.05, 1.05], [-0.05, 1.05], color="0.6", linewidth=1)
-            ax.set_xlim(-0.05, 1.05)
-            ax.set_ylim(-0.05, 1.05)
-            ax.set_xlabel(f"{a_name} ARI")
-            ax.set_ylabel(f"{b_name} ARI")
-            ax.set_title("Held-out paired ARI")
-            ax.set_aspect("equal")
-            ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        path = out_dir / "ari_paired.png"
-        fig.savefig(path, dpi=150)
-        plt.close(fig)
-        print(f"Wrote {path}", flush=True)
+    if not pairs:
+        return
+    n_pairs = len(pairs)
+    fig, axes = plt.subplots(
+        1, n_pairs, figsize=(5.4 * n_pairs, 5.4), squeeze=False,
+    )
+    axes = axes.ravel()
+    paired = {}
+    for r in ok:
+        paired.setdefault(r["pdb_id"], {})[r["method"]] = r["ari"]
+    for ax, (a_name, b_name) in zip(axes, pairs):
+        xs, ys = [], []
+        for vals in paired.values():
+            if a_name in vals and b_name in vals:
+                xs.append(vals[a_name])
+                ys.append(vals[b_name])
+        if not xs:
+            ax.set_visible(False)
+            continue
+        ax.scatter(xs, ys, s=28, alpha=0.85)
+        ax.plot([-0.05, 1.05], [-0.05, 1.05], color="0.6", linewidth=1)
+        ax.set_xlim(-0.05, 1.05)
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_xlabel(f"{a_name} ARI")
+        ax.set_ylabel(f"{b_name} ARI")
+        ax.set_title(title)
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"Wrote {path}", flush=True)
 
 
 def _print_ari_table(ok, method_names, title):
     print(f"\n=== {title} ===", flush=True)
+    if not ok or not method_names:
+        print("  (no assemblies)", flush=True)
+        return
+    n_asm = len({r["pdb_id"] for r in ok})
+    print(f"  n assemblies = {n_asm}", flush=True)
     header = f"{'class':>12}" + "".join(f"{m:>22}" for m in method_names)
     print(header, flush=True)
     for lab in ["all"] + OLIGOMER_ORDER:
         cells = [f"{lab:>12}"]
+        any_val = False
         for method in method_names:
             if lab == "all":
                 sub = [r["ari"] for r in ok if r["method"] == method]
@@ -593,9 +760,11 @@ def _print_ari_table(ok, method_names, title):
             if a.size == 0:
                 cells.append(f"{'n/a':>22}")
             else:
+                any_val = True
                 s = a.std(ddof=1) if a.size > 1 else 0.0
                 cells.append(f"{a.mean():8.3f} ± {s:<6.3f}".rjust(22))
-        print("".join(cells), flush=True)
+        if lab == "all" or any_val:
+            print("".join(cells), flush=True)
 
 
 def _paired_wins(ok, method_names):
@@ -641,6 +810,38 @@ def _paired_wins_two(ok, a_name, b_name):
     )
 
 
+def _print_k_recovery(ok, method_names):
+    rows = [
+        r for r in ok
+        if r.get("k_hat") not in ("", None) and r.get("n_chains") not in ("", None)
+    ]
+    if not rows:
+        return
+    print("\n=== Estimated k vs true n_chains ===", flush=True)
+    for method in method_names:
+        sub = [r for r in rows if r["method"] == method]
+        if not sub:
+            continue
+        hats, trues = [], []
+        for r in sub:
+            try:
+                hats.append(int(r["k_hat"]))
+                trues.append(int(r["n_chains"]))
+            except (TypeError, ValueError):
+                continue
+        if not hats:
+            continue
+        hats = np.array(hats)
+        trues = np.array(trues)
+        exact = float(np.mean(hats == trues))
+        mae = float(np.mean(np.abs(hats - trues)))
+        print(
+            f"  {method:16s}  exact={exact:.3f}  MAE={mae:.2f}  "
+            f"mean k_hat={hats.mean():.2f}  mean k_true={trues.mean():.2f}",
+            flush=True,
+        )
+
+
 def write_summary(rows, out_dir, method_names):
     splits = []
     for name in ("tune", "test"):
@@ -684,28 +885,51 @@ def write_summary(rows, out_dir, method_names):
                 ok = rows_for_eval(rows, split=split)
             else:
                 ok = [r for r in rows if r.get("error", "") == ""]
-            for method in method_names:
-                dump(split, "all", [r for r in ok if r["method"] == method], method)
+            balanced, unbalanced = split_by_subunit_balance(ok)
+            ssc_names = ssc_method_names(method_names)
+            for method in ssc_names:
+                dump(split, "balanced", [r for r in balanced if r["method"] == method], method)
                 for lab in OLIGOMER_ORDER:
                     dump(
                         split,
-                        lab,
-                        [r for r in ok if r["method"] == method and r["oligomer_label"] == lab],
+                        f"balanced:{lab}",
+                        [r for r in balanced if r["method"] == method and r["oligomer_label"] == lab],
+                        method,
+                    )
+            for method in method_names:
+                dump(split, "unbalanced", [r for r in unbalanced if r["method"] == method], method)
+                for lab in OLIGOMER_ORDER:
+                    dump(
+                        split,
+                        f"unbalanced:{lab}",
+                        [r for r in unbalanced if r["method"] == method and r["oligomer_label"] == lab],
                         method,
                     )
 
     print(f"Wrote {path}", flush=True)
 
+    def _report_split(ok, label):
+        balanced, unbalanced = split_by_subunit_balance(ok)
+        ssc_names = ssc_method_names(method_names)
+        _print_ari_table(
+            balanced, ssc_names,
+            f"{label} ARI — equal-size subunits (OSC / SSC-TV)",
+        )
+        _print_ari_table(
+            unbalanced, method_names,
+            f"{label} ARI — unequal-size subunits (TKSS included)",
+        )
+        print(f"\n--- {label} paired, equal-size subunits ---", flush=True)
+        _paired_wins(balanced, ssc_names)
+        print(f"\n--- {label} paired, unequal-size subunits ---", flush=True)
+        _paired_wins(unbalanced, method_names)
+        _print_k_recovery(ok, method_names)
+
     test_ok = rows_for_eval(rows, split="test")
     has_tune = any(r.get("split") == "tune" for r in rows)
     if has_tune:
-        _print_ari_table(
-            rows_for_eval(rows, split="tune"),
-            method_names,
-            "Tune-split mean ARI (selected params)",
-        )
-    _print_ari_table(test_ok, method_names, "Held-out test mean ARI")
-    _paired_wins(test_ok, method_names)
+        _report_split(rows_for_eval(rows, split="tune"), "Tune-split")
+    _report_split(test_ok, "Held-out test")
 
     print("\n=== Runtime (seconds, held-out test) ===", flush=True)
     for method in method_names:
@@ -723,22 +947,35 @@ def write_summary(rows, out_dir, method_names):
         )
 
 
-def write_tune_artifacts(out_dir, selected, all_rows, protocol):
+def write_tune_artifacts(out_dir, selected, all_rows, protocol, merge=False):
     csv_path = out_dir / "tune_grid.csv"
+    existing_rows = []
+    if merge and csv_path.exists():
+        with csv_path.open(newline="") as fh:
+            existing_rows = [
+                r for r in csv.DictReader(fh)
+                if r.get("method") not in selected
+            ]
+    combined = existing_rows + all_rows
     param_keys = sorted({
-        k for r in all_rows for k in r
+        k for r in combined for k in r
         if k not in ("method", "val_ari") and r.get(k) not in ("", None)
     })
     with csv_path.open("w", newline="") as fh:
         fields = ["method", *param_keys, "val_ari"]
         writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
-        for r in all_rows:
+        for r in combined:
             writer.writerow(r)
     print(f"Wrote {csv_path}", flush=True)
 
-    payload = {"protocol": protocol, "methods": selected}
     json_path = out_dir / "best_hyperparams.json"
+    if merge and json_path.exists():
+        payload = json.loads(json_path.read_text())
+        payload.setdefault("methods", {}).update(selected)
+        payload.setdefault("protocol", {}).update(protocol)
+    else:
+        payload = {"protocol": protocol, "methods": selected}
     json_path.write_text(json.dumps(payload, indent=2) + "\n")
     print(f"Wrote {json_path}", flush=True)
 
@@ -783,9 +1020,28 @@ def parse_args():
     p.add_argument(
         "--tune-frac", type=float, default=TUNE_FRAC,
         help="Fraction of assemblies used to tune (rest is held-out test). "
-             "0 skips the search and evaluates on all data.",
+             "Default 0.3.  0 skips the search and evaluates on all data.",
     )
     p.add_argument("--split-seed", type=int, default=SPLIT_SEED)
+    p.add_argument(
+        "--k", type=bench.parse_k_arg, default="oracle",
+        help="Cluster count: 'oracle' (default, true remaining-chain k), "
+             "'none' (infer via --k-method), or a positive integer.  True "
+             "subunit labels are always used for ARI / NMI.",
+    )
+    p.add_argument(
+        "--k-method", type=str, default="eigengap",
+        choices=["eigengap", "ncut"],
+        help="How to infer k when --k none (default: eigengap).",
+    )
+    p.add_argument(
+        "--min-k", type=int, default=2,
+        help="Minimum k when inferring (default 2; avoids trivial eigengap at 1).",
+    )
+    p.add_argument(
+        "--k-penalty", type=float, default=0.0,
+        help="Optional linear penalty for method=ncut (cost + penalty*k).",
+    )
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--pdb", nargs="+", default=None, help="Optional PDB ID subset.")
     p.add_argument("--methods", nargs="+", default=DEFAULT_METHODS, choices=METHOD_CHOICES)
@@ -802,6 +1058,12 @@ def parse_args():
         "--plot-only", action="store_true",
         help="Recompute summary and plots from out-dir/protein_benchmark.csv.",
     )
+    p.add_argument(
+        "--append", action="store_true",
+        help="Evaluate only --methods and merge into existing "
+             "protein_benchmark.csv / best_hyperparams.json (do not overwrite "
+             "rows for other methods).",
+    )
     return p.parse_args()
 
 
@@ -811,8 +1073,11 @@ def load_rows(path):
         for r in csv.DictReader(fh):
             rec = dict(r)
             rec.setdefault("split", "")
+            rec.setdefault("k_hat", "")
             for key in ("n_subunits_meta", "n_chains", "n_residues", "n_residues_raw", "stride"):
                 rec[key] = int(rec[key]) if rec[key] not in ("", None) else 0
+            if rec.get("k_hat") not in ("", None, "nan"):
+                rec["k_hat"] = int(float(rec["k_hat"]))
             rec["cutoff"] = float(rec["cutoff"])
             for key in ("ari", "nmi", "seconds"):
                 rec[key] = float(rec[key]) if rec[key] not in ("", "nan") else float("nan")
@@ -872,7 +1137,11 @@ def main():
         else:
             print(f"No params file at {path}; will tune or use solver defaults.", flush=True)
 
-    do_tune = (not args.smoke) and (not overrides) and args.tune_frac > 0
+    do_tune_names = [
+        m for m in args.methods
+        if m not in overrides and m in SEARCH_SPACES
+    ]
+    do_tune = (not args.smoke) and bool(do_tune_names) and args.tune_frac > 0
     if args.smoke:
         tune_meta, test_meta = [], meta_rows
     elif args.tune_frac <= 0:
@@ -895,6 +1164,13 @@ def main():
         f"(frac={args.tune_frac:g}, seed={args.split_seed})",
         flush=True,
     )
+    if args.k is None:
+        k_s = f"none ({args.k_method}, min_k={args.min_k})"
+    elif args.k == "oracle":
+        k_s = "oracle (true remaining-chain count)"
+    else:
+        k_s = str(args.k)
+    print(f"k={k_s}  (true subunit labels used only for ARI / NMI)", flush=True)
     for lab in OLIGOMER_ORDER:
         n_tr = sum(1 for r in tune_meta if r.get("oligomer_label") == lab)
         n_te = sum(1 for r in test_meta if r.get("oligomer_label") == lab)
@@ -926,11 +1202,16 @@ def main():
     if do_tune:
         t_tune = time.perf_counter()
         storage_path = out_dir / "optuna.db"
-        for i, name in enumerate(args.methods):
-            print("", flush=True)
+        for name in args.methods:
+            if name in overrides:
+                print(f"Reusing saved params for {name}: {overrides[name]}", flush=True)
+                if name in params_payload.get("methods", {}):
+                    selected[name] = params_payload["methods"][name]
+                continue
             if name not in SEARCH_SPACES:
                 print(f"No Optuna space for {name}; keeping solver defaults.", flush=True)
                 continue
+            print("", flush=True)
             print(
                 f"=== Tuning {name}  (Optuna TPE, {args.n_trials} trials × "
                 f"{n_ok_tune} graphs, max_iter={args.tune_max_iter}) ===",
@@ -940,9 +1221,13 @@ def main():
                 name, tune_graphs, args.tune_max_iter,
                 n_trials=args.n_trials,
                 n_startup=args.n_startup_trials,
-                seed=args.tune_seed + i,
+                seed=args.tune_seed + args.methods.index(name),
                 storage_path=storage_path,
                 resume=args.resume,
+                k=args.k,
+                k_method=args.k_method,
+                min_k=args.min_k,
+                penalty=args.k_penalty,
             )
             tune_rows.extend(rows)
             selected[name] = best
@@ -972,11 +1257,21 @@ def main():
             "y_normalization": "frobenius",
             "lambda_z": bench.LAMBDA_Z,
             "lambda_e21_scale": "sqrt(N)",
+            "k": "none" if args.k is None else args.k,
+            "k_method": args.k_method,
+            "min_k": args.min_k,
+            "k_penalty": args.k_penalty,
             "n_configs": {
-                m: args.n_trials for m in args.methods if m in SEARCH_SPACES
+                m: args.n_trials for m in do_tune_names
             },
+            "reused_methods": [
+                m for m in args.methods
+                if m not in do_tune_names and m in overrides
+            ],
         }
-        write_tune_artifacts(out_dir, selected, tune_rows, protocol)
+        write_tune_artifacts(
+            out_dir, selected, tune_rows, protocol, merge=args.append,
+        )
         print("\n=== Selected hyperparameters ===", flush=True)
         for name in args.methods:
             if name in selected:
@@ -999,25 +1294,45 @@ def main():
     n_jobs = sum(len(gs) for _, gs in eval_pairs) * len(methods)
     print(
         f"\nEvaluating selected params  "
-        f"({n_jobs} jobs, max_iter={args.max_iter})",
+        f"({n_jobs} jobs, max_iter={args.max_iter}"
+        f"{', append' if args.append else ''})",
         flush=True,
     )
 
     csv_path = out_dir / "protein_benchmark.csv"
-    rows = []
+    kept_rows = []
+    if args.append and csv_path.exists():
+        kept_rows = [
+            r for r in load_rows(csv_path) if r.get("method") not in args.methods
+        ]
+        print(
+            f"Append: keeping {len(kept_rows)} existing rows; "
+            f"replacing methods {args.methods}",
+            flush=True,
+        )
+
+    rows = list(kept_rows)
     done = 0
     t_start = time.perf_counter()
 
     with csv_path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=FIELDNAMES)
         writer.writeheader()
+        for r in kept_rows:
+            writer.writerow(r)
         for split, graphs in eval_pairs:
             done = eval_graphs(
                 graphs, methods, split, writer, fh, rows,
                 n_jobs, done, t_start, args.cutoff,
+                k=args.k, k_method=args.k_method,
+                min_k=args.min_k, penalty=args.k_penalty,
             )
 
-    method_names = [m for m, _ in methods]
+    # Prefer a stable method order: existing methods first, then newly run.
+    method_names = []
+    for name in METHOD_CHOICES:
+        if any(r.get("method") == name for r in rows):
+            method_names.append(name)
     write_summary(rows, out_dir, method_names)
     try:
         plot_results(rows, out_dir, method_names)

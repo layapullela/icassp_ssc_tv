@@ -1,17 +1,25 @@
 """
-SBM benchmark of OSC, six SSC-TV ADMM variants, and Temporal K-Subspaces
-(TKSS).  TKSS is a sequential K-subspaces method: it returns labels
-directly (no coefficient matrix / spectral clustering).  Subspace
-dimension d, sequential weight λ, and neighbor window s are the
+SBM benchmark of OSC, SSC-TV-E1E21-L21-P (the SSC-TV variant used for
+now), and Temporal K-Subspaces (TKSS).  Other SSC-TV ADMM files remain
+selectable via ``--methods``.  TKSS is a sequential K-subspaces method:
+it returns labels directly (no coefficient matrix / spectral clustering).
+Subspace dimension d, sequential weight λ, and neighbor window s are the
 tunable knobs; k is the true number of SBM blocks.
 
 Protocol
 --------
-200×200 undirected SBM test cases, Poisson observation noise with
-rate λ ∈ {0, 0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.00, 1.50, 2.00, 3.00}
-(λ = 0 is the noiseless adjacency), 10 independent draws per (case, λ).
-Spectral clustering (OSC / SSC-TV) uses the true number of SBM blocks k
-on W = |C| + |C|^T (OSC: |Z| + |Z|^T).  TKSS is given the same k.
+Undirected SBM test cases with Poisson observation noise (or Gaussian noise
+for cases 24–25), rate/σ ∈ {0, 0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.00,
+1.50, 2.00, 3.00}  (λ = 0 / σ = 0 is the noiseless adjacency), 10
+independent draws per (case, λ).  Spectral clustering (OSC / SSC-TV) uses
+the true number of SBM blocks k on W = |C| + |C|^T (OSC: |Z| + |Z|^T).
+TKSS is given the same k.  Pass ``--k none`` to drop the oracle k and
+instead estimate it (``--k-method eigengap|ncut``, default eigengap with
+``--min-k 2``).  OSC / SSC-TV infer on the coefficient affinity; TKSS on Y.
+
+Metrics: ARI (adjusted Rand index) and NMI (normalised mutual information,
+arithmetic average method) are recorded for every run.  Outlier cases also
+record precision / recall / F1 for the per-column outlier score.
 
 Cases
 -----
@@ -37,10 +45,37 @@ Probability sweep (sizes 50, 60, 90)
  11. Dense: p_in=0.8, p_out=0.2
  12. Weak communities: p_in=0.25, p_out=0.12
 
-Each observation matrix Y is Frobenius-normalised before clustering or
-tuning.  SSC-TV variants fix λ_z = 1 and tune the remaining penalties
-relative to it; λ_e21 stored in JSON is the pre-scale value and is
-multiplied by sqrt(N) at call time (N = number of columns of Y).
+Scalability sweep (3-block, proportional non-equal sizes, p=0.5/0.1)
+ 15. N=100   (27, 33, 40)
+ 16. N=400   (108, 132, 160)
+ 17. N=800   (216, 264, 320)
+     [Case 5 (N=200) serves as the N=200 anchor in scalability plots]
+
+Heterogeneous block model (different density per cluster pair; p_mat is K×K)
+ 18. 3-block hetero: block densities 0.70 / 0.40 / 0.20, varied cross-block
+ 19. 5-block hetero: diagonal 0.65→0.15, cross-block 0.01–0.07
+ 20. 3-block hetero sparse: diagonal 0.30 / 0.20 / 0.15
+
+Degree-corrected SBM (theta_i ~ Gamma(alpha,1), normalised per block)
+ 21. DC-SBM mild  (alpha=1.0, moderate degree spread)
+ 22. DC-SBM heavy (alpha=0.3, heavy-tailed degree distribution / hub nodes)
+ 23. DC-SBM + hetero B (alpha=0.5, heterogeneous affinity matrix)
+
+Gaussian noise model  (λ axis = σ, symmetric additive noise Y = A + σ Z_sym)
+ 24. 3-block p=0.5/0.1, Gaussian noise
+ 25. 3-block sparse p=0.15/0.03, Gaussian noise
+
+Large K / extreme difficulty
+ 26. 20-block (N=350, sizes 8–27), p_in=0.5, p_out=0.05
+ 27. 3-block + 20% ER outlier nodes (heavy outlier stress test)
+ 28. Very weak communities p_in=0.15, p_out=0.10
+ 29. Imbalanced + weak: (10, 40, 150), p_in=0.25, p_out=0.12
+
+Each observation matrix Y has columns scaled to unit ℓ2 norm before
+clustering or tuning.  The default SSC-TV variant (SSC-TV-E1E21-L21-P) fixes λ_z = 1
+and tunes the remaining penalties relative to it; λ_e21 stored in JSON
+is the pre-scale value and is multiplied by sqrt(N) at call time
+(N = number of columns of Y).
 
 ADMM solvers are imported from the existing modules; SSC-TV max_iter is
 raised to 200 to match OSC.  TKSS uses alternating subspace / assignment
@@ -50,11 +85,15 @@ updates (default 50 iters, early stop).  File defaults are used unless
 
 Usage
 -----
-    python tune_hyperparams.py                  # Optuna TPE, all 8 methods
+    python tune_hyperparams.py                  # Optuna TPE: OSC, SSC-TV-E1E21-L21-P, TKSS
     python tune_hyperparams.py --retune OSC     # one method; merge into JSON
     python benchmark_sbm.py --params results/best_hyperparams.json --out-dir results/tuned
+    python benchmark_sbm.py --k none --k-method eigengap --min-k 2
+    python benchmark_sbm.py --k none --k-method ncut
     python benchmark_sbm.py --trials 5 --out-dir results
     python benchmark_sbm.py --smoke             # one trial, λ=0, case 1 only
+    python benchmark_sbm.py --cases 15_scale_100 5_mild_three 16_scale_400 17_scale_800
+    python benchmark_sbm.py --cases 18_hetero_3block 21_dcsbm_mild 22_dcsbm_heavy
 """
 
 from __future__ import annotations
@@ -69,14 +108,19 @@ import traceback
 from pathlib import Path
 
 import numpy as np
-from sklearn.metrics import adjusted_rand_score
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from osc import cluster_from_Z, osc_exact  # noqa: E402
-from ssc_tv import cluster_from_C, ssc_admm_nuc_tv as ssc_tv_admm  # noqa: E402
+from bdosc import bd_qosc  # noqa: E402
+from ssc_tv import (  # noqa: E402
+    cluster_from_C,
+    estimate_k_from_data,
+    ssc_admm_nuc_tv as ssc_tv_admm,
+)
 from tkss import tkss_cluster  # noqa: E402
 
 
@@ -110,19 +154,38 @@ _mod_e1e21_l21_pq = _load_py(
     "method_ssc_tv_e1e21_l21_pq",
     "ssc_tv_e21_e1_and_l21_on_rows_and_columns.py",
 )
+_mod_l21_pq_sparse_c = _load_py(
+    "method_ssc_tv_l21_pq_sparse_c",
+    "ssc_tv_row_col_l21_c_sparse.py",
+)
+_mod_l21_pq_lowrank_c = _load_py(
+    "method_ssc_tv_l21_pq_lowrank_c",
+    "ssc-tv-nuclear-norm.py",
+)
 
 
 # lambda_z is fixed at 1; other ADMM penalties are tuned relative to it.
 # lambda_e21 in defaults / JSON is the *pre-scale* value; make_solver multiplies
 # by sqrt(N) at call time (N = number of columns of Y).
 LAMBDA_Z = 1.0
-SSC_DEFAULTS = dict(lambda_e=1.0, lambda_z=LAMBDA_Z, gamma=0.1, mu=1.0, sigma=1.0,
+SSC_DEFAULTS = dict(lambda_e=1.0, lambda_z=LAMBDA_Z, gamma=0.1, mu=0.1, sigma=1.0,
                     max_iter=200, tol=1e-4)
 E1E21_DEFAULTS = dict(lambda_e1=1.0, lambda_e21=1.0, lambda_z=LAMBDA_Z, gamma=0.1,
-                      mu=1.0, sigma=1.0, rho=1.0, max_iter=200, tol=1e-4)
-# osc_exact (SubKit / osc.m): λ1 on ||Z||_1, λ2 on ||ZR||_{1,2}, mu default 0.1.
+                      mu=0.1, sigma=1.0, rho=1.0, max_iter=200, tol=1e-4)
+# L21-PQ + explicit λ_c ||C||_1 split (S = C). rho is the ADMM penalty for that
+# constraint and is not searched; lambda_c is the extra tuned hyperparameter.
+SPARSE_C_DEFAULTS = dict(SSC_DEFAULTS, lambda_c=0.1, rho=1.0)
+# Same split / rho, but λ_c weights ||C||_* (nuclear / low-rank) instead of ||C||_1.
+LOWRANK_C_DEFAULTS = dict(SSC_DEFAULTS, lambda_c=0.1, rho=1.0)
+# osc_exact (SubKit / osc.m): λ1 on ||Z||_1, λ2 on ||ZR||_{1,2}, mu default 1.0.
 # Tuner / JSON still use lambda1/lambda2; make_solver maps them onto lambda_1/lambda_2.
-OSC_DEFAULTS = dict(lambda1=0.1, lambda2=1.0, mu=0.1, max_iter=200)
+OSC_DEFAULTS = dict(lambda1=0.1, lambda2=1.0, mu=0.1, max_iter=200, diagconstraint=True)
+# BD-QOSC: λ1 on ||ZᵀZ||_1, λ2 on ||ZR||_{2,1}, gamma1 ADMM penalty, p growth factor.
+# Requires k (block-diagonal projection). Tuner keys: lambda1/lambda2/gamma1/p.
+BDOSC_DEFAULTS = dict(
+    lambda1=0.1, lambda2=1.0, gamma1=0.1, p=1.1,
+    max_iter=200, diagconstraint=True, pos=False,
+)
 TKSS_DEFAULTS = dict(lam=1.0, s=1, d=1, max_iter=200, random_state=0)
 
 # Back-compat aliases used by older call sites / the tuner.
@@ -132,11 +195,18 @@ OSC_KW = OSC_DEFAULTS
 
 METHOD_SPECS = [
     dict(name="OSC", kind="osc", solver=None, defaults=OSC_DEFAULTS),
+    dict(name="BDOSC", kind="bdosc", solver=None, defaults=BDOSC_DEFAULTS),
     dict(name="SSC-TV", kind="ssc", solver=ssc_tv_admm, defaults=SSC_DEFAULTS),
     dict(name="SSC-TV-L21-P", kind="ssc", solver=_mod_l21_p.ssc_admm_nuc_tv,
          defaults=SSC_DEFAULTS),
     dict(name="SSC-TV-L21-PQ", kind="ssc", solver=_mod_l21_pq.ssc_admm_nuc_tv,
          defaults=SSC_DEFAULTS),
+    dict(name="SSC-TV-L21-PQ-SparseC", kind="ssc",
+         solver=_mod_l21_pq_sparse_c.ssc_admm_nuc_tv_sparse_c,
+         defaults=SPARSE_C_DEFAULTS),
+    dict(name="SSC-TV-L21-PQ-LowRankC", kind="ssc",
+         solver=_mod_l21_pq_lowrank_c.ssc_admm_nuc_tv,
+         defaults=LOWRANK_C_DEFAULTS),
     dict(name="SSC-TV-E1E21", kind="ssc", solver=_mod_e1e21.ssc_admm_nuc_tv_e1_e21,
          defaults=E1E21_DEFAULTS),
     dict(name="SSC-TV-E1E21-L21-P", kind="ssc",
@@ -147,6 +217,10 @@ METHOD_SPECS = [
 ]
 
 METHOD_KIND = {s["name"]: s["kind"] for s in METHOD_SPECS}
+# Default comparison set: OSC and TKSS plus one SSC-TV variant
+# (ssc_tv_e21_e1_and_l21_on_columns_l1_on_rows.py).  Other METHOD_SPECS
+# names remain valid --methods choices.
+DEFAULT_METHODS = ["OSC", "SSC-TV-E1E21-L21-P", "TKSS"]
 
 
 def _osc_exact_kwargs(kw):
@@ -172,11 +246,10 @@ def _osc_exact_kwargs(kw):
 
 
 def normalize_Y(Y):
-    """Unit-Frobenius scale so ADMM penalties stay relative to ``lambda_z=1``."""
+    """Scale each column of ``Y`` to unit ℓ2 norm (zero columns left as zeros)."""
     Y = np.asarray(Y, dtype=float)
-    scale = np.linalg.norm(Y, "fro")
-    if not np.isfinite(scale) or scale == 0.0:
-        return Y
+    scale = np.linalg.norm(Y, axis=0, keepdims=True)
+    scale[~np.isfinite(scale) | (scale == 0.0)] = 1.0
     return Y / scale
 
 
@@ -190,10 +263,37 @@ def _ssc_call_kwargs(kw, Y):
     return call_kw
 
 
+def _bdosc_kwargs(kw):
+    """Map tuner / JSON keys onto ``bd_qosc``'s signature."""
+    out = {}
+    if "lambda_1" in kw:
+        out["lambda_1"] = float(kw["lambda_1"])
+    elif "lambda1" in kw:
+        out["lambda_1"] = float(kw["lambda1"])
+    if "lambda_2" in kw:
+        out["lambda_2"] = float(kw["lambda_2"])
+    elif "lambda2" in kw:
+        out["lambda_2"] = float(kw["lambda2"])
+    if "gamma_1" in kw:
+        out["gamma_1"] = float(kw["gamma_1"])
+    elif "gamma1" in kw:
+        out["gamma_1"] = float(kw["gamma1"])
+    if "p" in kw:
+        out["p"] = float(kw["p"])
+    if "max_iter" in kw:
+        out["max_iter"] = int(kw["max_iter"])
+    if "diagconstraint" in kw:
+        out["diagconstraint"] = bool(kw["diagconstraint"])
+    if "pos" in kw:
+        out["pos"] = bool(kw["pos"])
+    return out
+
+
 def make_solver(spec, kwargs):
     """Bind a solver spec to a kwargs dict.
 
     ADMM methods (OSC / SSC-TV): ``fn(Y) -> (coeff, E, F)``.
+    BDOSC: ``fn(Y, k) -> (coeff, E, F)`` (needs k for block-diagonal projection).
     TKSS: ``fn(Y, k) -> (labels, residual)``.
 
     SSC variants always run with ``lambda_z=1``.  ``lambda_e21`` stored in
@@ -208,13 +308,19 @@ def make_solver(spec, kwargs):
             E = Y - Y @ Z
             return Z, E, None
         return fn
+    if spec["kind"] == "bdosc":
+        def fn(Y, k, _kw=kw):
+            Z, _, _ = bd_qosc(Y, int(k), **_bdosc_kwargs(_kw))
+            E = Y - Y @ Z
+            return Z, E, None
+        return fn
     if spec["kind"] == "tkss":
         def fn(Y, k, _kw=kw):
             d = int(round(_kw.get("d", 1)))
             s = int(round(_kw.get("s", 1)))
             return tkss_cluster(
                 Y,
-                k=int(k),
+                k=k,
                 d=max(1, d),
                 lam=float(_kw.get("lam", 1.0)),
                 s=max(0, s),
@@ -241,7 +347,7 @@ def build_methods(overrides=None, max_iter=None, names=None):
         if spec["name"] not in wanted:
             continue
         kw = dict(spec["defaults"])
-        if max_iter is not None and spec["kind"] != "tkss":
+        if max_iter is not None and spec["kind"] not in ("tkss",):
             kw["max_iter"] = max_iter
         extra = overrides.get(spec["name"], {})
         kw.update(extra)
@@ -267,12 +373,46 @@ METHODS = build_methods()  # defaults; rebuilt in main() if --params is given
 
 # ── SBM generation ────────────────────────────────────────────────────────────
 
-def generate_sbm(cluster_sizes, p_in, p_out, rng):
-    """Undirected SBM: Bernoulli upper triangle, symmetrised, zero diagonal."""
+def generate_sbm(cluster_sizes, p_in=None, p_out=None, rng=None, *, p_mat=None):
+    """Undirected SBM: Bernoulli upper triangle, symmetrised, zero diagonal.
+
+    If *p_mat* (K×K array-like) is given it overrides p_in/p_out, enabling
+    heterogeneous within- and between-cluster densities across every block pair.
+    """
     labels = np.repeat(np.arange(len(cluster_sizes)), cluster_sizes)
     n = labels.size
-    same = labels[:, None] == labels[None, :]
-    probs = np.where(same, p_in, p_out)
+    if p_mat is not None:
+        pm = np.asarray(p_mat, dtype=float)
+        probs = pm[labels[:, None], labels[None, :]]
+    else:
+        same = labels[:, None] == labels[None, :]
+        probs = np.where(same, p_in, p_out)
+    upper = np.triu(rng.random((n, n)) < probs, k=1).astype(float)
+    A = upper + upper.T
+    return A, labels
+
+
+def generate_dcsbm(cluster_sizes, B, theta_alpha, rng):
+    """Degree-corrected SBM with Gamma(theta_alpha, 1) degree heterogeneity.
+
+    theta_i is drawn per node and normalised so the mean theta equals 1 within
+    each block, preserving the same expected density as B[k,l].
+    Edge probability: min(1, theta_i * theta_j * B[z_i, z_j]).
+    Small theta_alpha (e.g. 0.3) gives a heavy-tailed degree distribution.
+    """
+    labels = np.repeat(np.arange(len(cluster_sizes)), cluster_sizes)
+    n = labels.size
+    theta = rng.gamma(theta_alpha, 1.0, size=n)
+    for k_idx in range(len(cluster_sizes)):
+        mask = labels == k_idx
+        mu = theta[mask].mean()
+        if mu > 0:
+            theta[mask] /= mu
+    Bm = np.asarray(B, dtype=float)
+    probs = np.clip(
+        theta[:, None] * theta[None, :] * Bm[labels[:, None], labels[None, :]],
+        0.0, 1.0,
+    )
     upper = np.triu(rng.random((n, n)) < probs, k=1).astype(float)
     A = upper + upper.T
     return A, labels
@@ -293,6 +433,21 @@ def add_poisson_noise(A, lam, rng):
     Y = Y + noise
     np.fill_diagonal(Y, 0.0)
     return Y
+
+
+def add_gaussian_noise(A, sigma, rng):
+    """Y = A + σ · Z_sym where Z_sym = (Z + Z.T) / √2, Z ~ N(0,1)^{n×n}.
+
+    sigma = 0 leaves A unchanged.  Unlike Poisson noise, entries may be negative.
+    """
+    Y = A.astype(float, copy=True)
+    if sigma <= 0:
+        return Y
+    n = A.shape[0]
+    Z = rng.standard_normal((n, n))
+    Z_sym = (Z + Z.T) / np.sqrt(2.0)
+    np.fill_diagonal(Z_sym, 0.0)
+    return Y + sigma * Z_sym
 
 
 def inject_er_outliers(A, frac, p, rng):
@@ -443,11 +598,177 @@ CASES = {
         "k": 12,
         "title": "12-block (8–35)",
     },
+    # ── Scalability sweep (3-block, proportional non-equal sizes, p=0.5/0.1) ──
+    # TKSS initialises to K equal-length blocks; all sizes here are unequal.
+    # Case 5_mild_three (N=200, sizes 55,65,80) serves as the N=200 anchor.
+    "15_scale_100": {
+        "sizes": (27, 33, 40),
+        "p_in": 0.5,
+        "p_out": 0.1,
+        "outliers": False,
+        "k": 3,
+        "title": "scale N=100  (27,33,40)",
+    },
+    "16_scale_400": {
+        "sizes": (108, 132, 160),
+        "p_in": 0.5,
+        "p_out": 0.1,
+        "outliers": False,
+        "k": 3,
+        "title": "scale N=400  (108,132,160)",
+    },
+    "17_scale_800": {
+        "sizes": (216, 264, 320),
+        "p_in": 0.5,
+        "p_out": 0.1,
+        "outliers": False,
+        "k": 3,
+        "title": "scale N=800  (216,264,320)",
+    },
+    # ── Heterogeneous block model (different density per cluster pair) ────────
+    # p_mat is K×K; diagonal = within-cluster density, off-diagonal = between.
+    "18_hetero_3block": {
+        "sizes": (50, 70, 80),
+        "p_mat": [
+            [0.70, 0.05, 0.02],
+            [0.05, 0.40, 0.08],
+            [0.02, 0.08, 0.20],
+        ],
+        "outliers": False,
+        "k": 3,
+        "title": "hetero 3-block (p_mat)",
+    },
+    "19_hetero_5block": {
+        "sizes": (30, 40, 35, 45, 50),
+        "p_mat": [
+            [0.65, 0.04, 0.03, 0.02, 0.01],
+            [0.04, 0.50, 0.05, 0.03, 0.02],
+            [0.03, 0.05, 0.35, 0.06, 0.03],
+            [0.02, 0.03, 0.06, 0.25, 0.07],
+            [0.01, 0.02, 0.03, 0.07, 0.15],
+        ],
+        "outliers": False,
+        "k": 5,
+        "title": "hetero 5-block (p_mat)",
+    },
+    "20_hetero_sparse": {
+        "sizes": (55, 65, 80),
+        "p_mat": [
+            [0.30, 0.02, 0.01],
+            [0.02, 0.20, 0.04],
+            [0.01, 0.04, 0.15],
+        ],
+        "outliers": False,
+        "k": 3,
+        "title": "hetero sparse 3-block (p_mat)",
+    },
+    # ── Degree-corrected SBM (heterogeneous degree within blocks) ─────────────
+    # B plays the role of p_mat; theta_i ~ Gamma(theta_alpha, 1), norm per block.
+    # theta_alpha=1.0: moderate heterogeneity; 0.3: heavy-tailed (hub nodes).
+    "21_dcsbm_mild": {
+        "sizes": (55, 65, 80),
+        "dc_sbm": True,
+        "B": [
+            [0.50, 0.10, 0.05],
+            [0.10, 0.50, 0.08],
+            [0.05, 0.08, 0.50],
+        ],
+        "theta_alpha": 1.0,
+        "outliers": False,
+        "k": 3,
+        "title": "DC-SBM mild (α=1.0)",
+    },
+    "22_dcsbm_heavy": {
+        "sizes": (55, 65, 80),
+        "dc_sbm": True,
+        "B": [
+            [0.50, 0.10, 0.05],
+            [0.10, 0.50, 0.08],
+            [0.05, 0.08, 0.50],
+        ],
+        "theta_alpha": 0.3,
+        "outliers": False,
+        "k": 3,
+        "title": "DC-SBM heavy-tail (α=0.3)",
+    },
+    "23_dcsbm_hetero": {
+        "sizes": (50, 70, 80),
+        "dc_sbm": True,
+        "B": [
+            [0.70, 0.05, 0.02],
+            [0.05, 0.40, 0.08],
+            [0.02, 0.08, 0.20],
+        ],
+        "theta_alpha": 0.5,
+        "outliers": False,
+        "k": 3,
+        "title": "DC-SBM + hetero B (α=0.5)",
+    },
+    # ── Gaussian noise model (λ interpreted as σ) ─────────────────────────────
+    "24_gaussian_3block": {
+        "sizes": (50, 60, 90),
+        "p_in": 0.5,
+        "p_out": 0.1,
+        "noise_model": "gaussian",
+        "outliers": False,
+        "k": 3,
+        "title": "3-block Gaussian noise  σ sweep",
+    },
+    "25_gaussian_sparse": {
+        "sizes": (50, 60, 90),
+        "p_in": 0.15,
+        "p_out": 0.03,
+        "noise_model": "gaussian",
+        "outliers": False,
+        "k": 3,
+        "title": "sparse 3-block Gaussian noise  σ sweep",
+    },
+    # ── Large number of clusters ───────────────────────────────────────────────
+    "26_twenty_block": {
+        "sizes": (8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+                  18, 19, 20, 21, 22, 23, 24, 25, 26, 27),
+        "p_in": 0.5,
+        "p_out": 0.05,
+        "outliers": False,
+        "k": 20,
+        "title": "20-block (N=350, p=0.5/0.05)",
+    },
+    # ── Heavy outliers (20%) ───────────────────────────────────────────────────
+    "27_heavy_outliers": {
+        "sizes": (50, 60, 90),
+        "p_in": 0.5,
+        "p_out": 0.1,
+        "outliers": True,
+        "outlier_frac": 0.20,
+        "outlier_p": 0.5,
+        "k": 3,
+        "title": "3-block + 20% ER outliers",
+    },
+    # ── Very weak clusters (p_in barely above p_out) ─────────────────────────
+    "28_very_weak": {
+        "sizes": (55, 65, 80),
+        "p_in": 0.15,
+        "p_out": 0.10,
+        "outliers": False,
+        "k": 3,
+        "title": "very weak  p=0.15/0.10",
+    },
+    # ── Severely imbalanced + weak (stress test) ──────────────────────────────
+    "29_imbalanced_weak": {
+        "sizes": (10, 40, 150),
+        "p_in": 0.25,
+        "p_out": 0.12,
+        "outliers": False,
+        "k": 3,
+        "title": "imbalanced+weak (10,40,150)  p=0.25/0.12",
+    },
 }
 
-LAMBDAS = (0.0, 0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.00, 1.50, 2.00, 3.00)
+# LAMBDAS = (0.0, 0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.00, 1.50, 2.00, 3.00)
+LAMBDAS =  (0.0, 0.25, 0.5, 1.0, 2.0, 3.0)
 
-# ARI vs λ is split across two figures so the 14 cases stay readable.
+# ARI vs λ is split across figures so the cases stay readable.
+# Cases named "scale_*" are handled by plot_scalability (ARI/NMI vs N).
 ARI_PLOT_GROUPS = [
     (
         "ari_vs_lambda.png",
@@ -473,60 +794,161 @@ ARI_PLOT_GROUPS = [
             "14_twelve_block",
         ),
     ),
+    (
+        "ari_vs_lambda_hetero.png",
+        (
+            "18_hetero_3block",
+            "19_hetero_5block",
+            "20_hetero_sparse",
+            "21_dcsbm_mild",
+            "22_dcsbm_heavy",
+            "23_dcsbm_hetero",
+        ),
+    ),
+    (
+        "ari_vs_lambda_noise_outliers.png",
+        (
+            "24_gaussian_3block",
+            "25_gaussian_sparse",
+            "26_twenty_block",
+            "27_heavy_outliers",
+            "28_very_weak",
+            "29_imbalanced_weak",
+        ),
+    ),
 ]
+
+# Scalability group: these cases + 5_mild_three (N=200 anchor) are plotted
+# by plot_scalability as ARI/NMI vs N at selected noise levels.
+SCALE_CASES = ("15_scale_100", "5_mild_three", "16_scale_400", "17_scale_800")
+SCALE_N = {
+    "15_scale_100": 100,
+    "5_mild_three": 200,
+    "16_scale_400": 400,
+    "17_scale_800": 800,
+}
 FIELDNAMES = [
-    "case", "lambda", "trial", "method",
-    "ari", "precision", "recall", "f1", "seconds", "error",
+    "case", "lambda", "trial", "method", "k",
+    "ari", "nmi", "precision", "recall", "f1", "seconds", "error",
 ]
 
 
-def run_one(Y, labels, k, method_name, solver, outlier_mask):
+def parse_k_arg(value):
+    """CLI / JSON k: ``'oracle'``, ``'none'`` (infer), or a positive int."""
+    s = str(value).strip().lower()
+    if s == "oracle":
+        return "oracle"
+    if s in ("none", "null"):
+        return None
+    try:
+        k = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"k must be an integer, 'none', or 'oracle' (got {value!r})"
+        ) from exc
+    if k < 1:
+        raise argparse.ArgumentTypeError("k must be >= 1")
+    return k
+
+
+def resolve_run_k(k, oracle_k):
+    """Map CLI k onto the value passed to ``run_one``.
+
+    ``'oracle'`` (default) uses the true SBM block count; ``None`` leaves k
+    unset so the solver infers it via ``--k-method``.
+    """
+    if k == "oracle":
+        return int(oracle_k)
+    return k
+
+
+def run_one(Y, labels, k, method_name, solver, outlier_mask,
+            k_method="eigengap", min_k=2, penalty=0.0):
     Y = normalize_Y(Y)
     t0 = time.perf_counter()
-    if METHOD_KIND.get(method_name) == "tkss":
+    kind = METHOD_KIND.get(method_name)
+    if kind == "tkss":
+        if k is None:
+            k = estimate_k_from_data(
+                Y, method=k_method, min_k=min_k, penalty=penalty,
+            )
         pred, residual = solver(Y, k)
         elapsed = time.perf_counter() - t0
         scores = residual
+    elif kind == "bdosc":
+        # Block-diagonal projection needs k during the ADMM solve.
+        if k is None:
+            k = estimate_k_from_data(
+                Y, method=k_method, min_k=min_k, penalty=penalty,
+            )
+        coeff, E, F = solver(Y, k)
+        elapsed = time.perf_counter() - t0
+        pred = cluster_from_Z(
+            coeff, k=k, method=k_method, min_k=min_k, penalty=penalty,
+        )
+        scores = np.linalg.norm(F if F is not None else E, axis=0)
     else:
         coeff, E, F = solver(Y)
         elapsed = time.perf_counter() - t0
         if method_name == "OSC":
-            pred = cluster_from_Z(coeff, k=k)
+            pred = cluster_from_Z(
+                coeff, k=k, method=k_method, min_k=min_k, penalty=penalty,
+            )
         else:
-            pred = cluster_from_C(coeff, k=k)
+            pred = cluster_from_C(
+                coeff, k=k, method=k_method, min_k=min_k, penalty=penalty,
+            )
+        if k is None:
+            k = int(np.unique(pred).size)
         scores = np.linalg.norm(F if F is not None else E, axis=0)
 
     if outlier_mask is None:
         ari = float(adjusted_rand_score(labels, pred))
+        nmi = float(normalized_mutual_info_score(labels, pred, average_method="arithmetic"))
         prec = rec = f1 = float("nan")
     else:
         inliers = ~outlier_mask
         ari = float(adjusted_rand_score(labels[inliers], pred[inliers]))
+        nmi = float(normalized_mutual_info_score(labels[inliers], pred[inliers], average_method="arithmetic"))
         prec, rec, f1 = outlier_prf(scores, outlier_mask)
 
     return {
         "ari": ari,
+        "nmi": nmi,
         "precision": prec,
         "recall": rec,
         "f1": f1,
         "seconds": elapsed,
+        "k": int(k),
         "error": "",
     }
 
 
 def make_observation(cfg, lam, rng):
-    A, labels = generate_sbm(cfg["sizes"], cfg["p_in"], cfg["p_out"], rng)
+    if cfg.get("dc_sbm"):
+        A, labels = generate_dcsbm(
+            cfg["sizes"], cfg["B"], cfg.get("theta_alpha", 0.5), rng,
+        )
+    elif cfg.get("p_mat") is not None:
+        A, labels = generate_sbm(cfg["sizes"], rng=rng, p_mat=cfg["p_mat"])
+    else:
+        A, labels = generate_sbm(cfg["sizes"], cfg["p_in"], cfg["p_out"], rng)
     outlier_mask = None
     if cfg.get("outliers"):
         A, outlier_mask = inject_er_outliers(
             A, cfg["outlier_frac"], cfg["outlier_p"], rng,
         )
-    Y = add_poisson_noise(A, lam, rng)
+    noise_model = cfg.get("noise_model", "poisson")
+    if noise_model == "gaussian":
+        Y = add_gaussian_noise(A, lam, rng)
+    else:
+        Y = add_poisson_noise(A, lam, rng)
     Y = normalize_Y(Y)
     return Y, labels, outlier_mask
 
 
-def run_benchmark(cases, lambdas, n_trials, methods, seed, out_dir):
+def run_benchmark(cases, lambdas, n_trials, methods, seed, out_dir, k="oracle",
+                  k_method="eigengap", min_k=2, penalty=0.0):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "sbm_benchmark.csv"
@@ -558,7 +980,9 @@ def run_benchmark(cases, lambdas, n_trials, methods, seed, out_dir):
                             "lambda": lam,
                             "trial": trial,
                             "method": method_name,
+                            "k": "",
                             "ari": float("nan"),
+                            "nmi": float("nan"),
                             "precision": float("nan"),
                             "recall": float("nan"),
                             "f1": float("nan"),
@@ -567,8 +991,9 @@ def run_benchmark(cases, lambdas, n_trials, methods, seed, out_dir):
                         }
                         try:
                             rec.update(run_one(
-                                Y, labels, cfg["k"],
+                                Y, labels, resolve_run_k(k, cfg["k"]),
                                 method_name, solver, outlier_mask,
+                                k_method=k_method, min_k=min_k, penalty=penalty,
                             ))
                         except Exception as exc:
                             rec["error"] = f"{type(exc).__name__}: {exc}"
@@ -582,7 +1007,7 @@ def run_benchmark(cases, lambdas, n_trials, methods, seed, out_dir):
                         eta = (elapsed / done) * (n_jobs - done) if done else 0
                         status = (
                             f"[{done}/{n_jobs}] {case_name}  λ={lam}  "
-                            f"trial={trial}  {method_name}  "
+                            f"trial={trial}  {method_name}  k={rec.get('k', '')}  "
                             f"ARI={rec['ari']:.3f}"
                             if rec["error"] == ""
                             else f"[{done}/{n_jobs}] {method_name} FAILED: {rec['error']}"
@@ -613,6 +1038,7 @@ def write_summary(rows, out_dir, method_names=None):
         fields = [
             "case", "lambda", "method", "n",
             "ari_mean", "ari_std",
+            "nmi_mean", "nmi_std",
             "precision_mean", "precision_std",
             "recall_mean", "recall_std",
             "f1_mean", "f1_std",
@@ -625,6 +1051,7 @@ def write_summary(rows, out_dir, method_names=None):
                    if r["case"] == case and r["lambda"] == lam
                    and r["method"] == method and r["error"] == ""]
             ari = _finite([r["ari"] for r in sub])
+            nmi = _finite([r.get("nmi", float("nan")) for r in sub])
             prec = _finite([r["precision"] for r in sub])
             rec = _finite([r["recall"] for r in sub])
             f1 = _finite([r["f1"] for r in sub])
@@ -636,6 +1063,7 @@ def write_summary(rows, out_dir, method_names=None):
                 return float(a.mean()), float(a.std(ddof=1) if a.size > 1 else 0.0)
 
             ari_m, ari_s = mean_std(ari)
+            nmi_m, nmi_s = mean_std(nmi)
             p_m, p_s = mean_std(prec)
             r_m, r_s = mean_std(rec)
             f_m, f_s = mean_std(f1)
@@ -643,6 +1071,7 @@ def write_summary(rows, out_dir, method_names=None):
             writer.writerow({
                 "case": case, "lambda": lam, "method": method, "n": len(sub),
                 "ari_mean": ari_m, "ari_std": ari_s,
+                "nmi_mean": nmi_m, "nmi_std": nmi_s,
                 "precision_mean": p_m, "precision_std": p_s,
                 "recall_mean": r_m, "recall_std": r_s,
                 "f1_mean": f_m, "f1_std": f_s,
@@ -650,9 +1079,8 @@ def write_summary(rows, out_dir, method_names=None):
             })
     print(f"Wrote {path}", flush=True)
 
-    # Compact stdout table: ARI mean ± std per case, averaged over λ, then
-    # the full per-λ grid.
-    print("\n=== ARI mean ± std (over trials, per λ) ===", flush=True)
+    # Compact stdout table: ARI mean ± std and NMI mean per case, per λ.
+    print("\n=== ARI mean ± std  /  NMI mean (over trials, per λ) ===", flush=True)
     methods = method_names or [s["name"] for s in METHOD_SPECS]
     present = {r["case"] for r in rows}
     case_order = [c for c in CASES if c in present] or sorted(present)
@@ -664,21 +1092,25 @@ def write_summary(rows, out_dir, method_names=None):
         for lam in lams:
             cells = [f"{lam:8.2f}"]
             for method in methods:
-                sub = [r["ari"] for r in rows
+                sub = [r for r in rows
                        if r["case"] == case and r["lambda"] == lam
                        and r["method"] == method and r["error"] == ""]
-                a = _finite(sub)
+                a = _finite([r["ari"] for r in sub])
+                nm = _finite([r.get("nmi", float("nan")) for r in sub])
                 if a.size == 0:
                     cells.append(f"{'n/a':>22}")
                 else:
                     m = a.mean()
                     s = a.std(ddof=1) if a.size > 1 else 0.0
-                    cells.append(f"{m:8.3f} ± {s:<6.3f}".rjust(22))
+                    nmi_str = f"{nm.mean():.3f}" if nm.size else "n/a"
+                    cells.append(f"{m:6.3f}±{s:<5.3f}NMI{nmi_str}".rjust(22))
             print("".join(cells), flush=True)
 
-    outlier_rows = [r for r in rows if r["case"] == "4_three_block_outliers"]
-    if outlier_rows:
-        print("\n=== Case 4 outlier F1 mean ± std ===", flush=True)
+    outlier_cases = [c for c in ["4_three_block_outliers", "27_heavy_outliers"]
+                     if any(r["case"] == c for r in rows)]
+    for outlier_case in outlier_cases:
+        outlier_rows = [r for r in rows if r["case"] == outlier_case]
+        print(f"\n=== {outlier_case} outlier F1 mean ± std ===", flush=True)
         header = f"{'λ':>8}" + "".join(f"{m:>22}" for m in methods)
         print(header, flush=True)
         lams = sorted({r["lambda"] for r in outlier_rows})
@@ -748,7 +1180,10 @@ def _plot_ari_grid(rows, cases, methods, markers, out_path):
             )
         title = CASES.get(case, {}).get("title", case)
         ax.set_title(title, fontsize=10)
-        ax.set_xlabel("Poisson rate λ")
+        noise_label = ("Gaussian σ"
+                       if CASES.get(case, {}).get("noise_model") == "gaussian"
+                       else "Poisson rate λ")
+        ax.set_xlabel(noise_label)
         ax.set_ylabel("ARI")
         ax.set_ylim(-0.05, 1.05)
         ax.grid(True, alpha=0.3)
@@ -759,6 +1194,59 @@ def _plot_ari_grid(rows, cases, methods, markers, out_path):
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Wrote {out_path}", flush=True)
+
+
+def plot_scalability(rows, out_dir, methods, markers, lambdas_to_show=(0.0, 0.5, 1.0)):
+    """ARI and NMI vs N for SCALE_CASES at selected noise levels."""
+    import matplotlib.pyplot as plt
+
+    present = {r["case"] for r in rows}
+    scale_cases = [c for c in SCALE_CASES if c in present]
+    if not scale_cases:
+        return
+
+    ns = [SCALE_N[c] for c in scale_cases]
+    lams_present = sorted({r["lambda"] for r in rows
+                           if r["case"] in scale_cases})
+    show_lams = [lam for lam in lambdas_to_show if lam in lams_present]
+    if not show_lams:
+        show_lams = lams_present[:3]
+
+    for metric, ylabel, fname in [
+        ("ari", "ARI", "scalability_ari_vs_n.png"),
+        ("nmi", "NMI", "scalability_nmi_vs_n.png"),
+    ]:
+        fig, axes = plt.subplots(
+            1, len(show_lams),
+            figsize=(4.8 * len(show_lams), 4.0),
+            sharey=True,
+        )
+        axes = np.atleast_1d(axes).ravel()
+        for ax, lam in zip(axes, show_lams):
+            for i, method in enumerate(methods):
+                vals = []
+                for case in scale_cases:
+                    a = _finite([
+                        r[metric] for r in rows
+                        if r["case"] == case and r["lambda"] == lam
+                        and r["method"] == method and r["error"] == ""
+                    ])
+                    vals.append(a.mean() if a.size else np.nan)
+                ax.plot(ns, vals, marker=markers[i % len(markers)],
+                        linewidth=1.4, label=method)
+            ax.set_title(f"Poisson λ={lam}", fontsize=10)
+            ax.set_xlabel("N (number of nodes)")
+            ax.set_ylabel(ylabel)
+            ax.set_ylim(-0.05, 1.05)
+            ax.grid(True, alpha=0.3)
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False,
+                   bbox_to_anchor=(0.5, 1.04))
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+        out_path = Path(out_dir) / fname
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Wrote {out_path}", flush=True)
 
 
 def plot_results(rows, out_dir, method_names=None):
@@ -783,20 +1271,22 @@ def plot_results(rows, out_dir, method_names=None):
             Path(out_dir) / "ari_vs_lambda_other.png",
         )
 
-    case4 = [r for r in rows if r["case"] == "4_three_block_outliers"]
-    if case4:
+    for outlier_case in ["4_three_block_outliers", "27_heavy_outliers"]:
+        case_rows = [r for r in rows if r["case"] == outlier_case]
+        if not case_rows:
+            continue
         fig, axes = plt.subplots(1, 3, figsize=(12, 3.6), sharey=True)
         for ax, metric, title in zip(
             axes,
             ("precision", "recall", "f1"),
             ("Outlier precision", "Outlier recall", "Outlier F1"),
         ):
-            lams = sorted({r["lambda"] for r in case4})
+            lams = sorted({r["lambda"] for r in case_rows})
             for i, method in enumerate(methods):
                 means, stds = [], []
                 for lam in lams:
                     a = _finite([
-                        r[metric] for r in case4
+                        r[metric] for r in case_rows
                         if r["lambda"] == lam and r["method"] == method
                         and r["error"] == ""
                     ])
@@ -814,11 +1304,12 @@ def plot_results(rows, out_dir, method_names=None):
         fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False,
                    bbox_to_anchor=(0.5, 1.08))
         fig.tight_layout()
-        out_path = out_dir / "case4_outlier_detection.png"
+        out_path = Path(out_dir) / f"{outlier_case}_detection.png"
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"Wrote {out_path}", flush=True)
 
+    plot_scalability(rows, out_dir, methods, markers)
     plot_runtime(rows, out_dir, methods)
 
 
@@ -908,8 +1399,8 @@ def parse_args():
         choices=list(CASES),
     )
     p.add_argument(
-        "--methods", nargs="+", default=[m for m, _ in METHODS],
-        choices=[m for m, _ in METHODS],
+        "--methods", nargs="+", default=list(DEFAULT_METHODS),
+        choices=[s["name"] for s in METHOD_SPECS],
     )
     p.add_argument(
         "--lambdas", type=float, nargs="+", default=list(LAMBDAS),
@@ -917,6 +1408,24 @@ def parse_args():
     p.add_argument(
         "--smoke", action="store_true",
         help="One trial, λ=0, case 1 only — check imports and a single ADMM run.",
+    )
+    p.add_argument(
+        "--k", type=parse_k_arg, default="oracle",
+        help="Cluster count: 'oracle' (default, true SBM k), 'none' (infer "
+             "via --k-method), or a positive integer.",
+    )
+    p.add_argument(
+        "--k-method", type=str, default="eigengap",
+        choices=["eigengap", "ncut"],
+        help="How to infer k when --k none (default: eigengap).",
+    )
+    p.add_argument(
+        "--min-k", type=int, default=2,
+        help="Minimum k when inferring (default 2; avoids trivial eigengap at 1).",
+    )
+    p.add_argument(
+        "--k-penalty", type=float, default=0.0,
+        help="Optional linear penalty for method=ncut (cost + penalty*k).",
     )
     p.add_argument(
         "--params", type=str, default=None,
@@ -936,7 +1445,9 @@ def load_benchmark_csv(path):
             rec = dict(r)
             rec["lambda"] = float(rec["lambda"])
             rec["trial"] = int(rec["trial"])
-            for key in ("ari", "precision", "recall", "f1", "seconds"):
+            if rec.get("k") not in (None, "", "nan"):
+                rec["k"] = int(float(rec["k"]))
+            for key in ("ari", "nmi", "precision", "recall", "f1", "seconds"):
                 rec[key] = float(rec[key]) if rec[key] not in ("", "nan") else float("nan")
             rows.append(rec)
     return rows
@@ -973,13 +1484,20 @@ def main():
                 print(f"  {name}: {overrides[name]}", flush=True)
     methods = build_methods(overrides=overrides, names=args.methods)
     n = len(cases) * len(lambdas) * n_trials * len(methods)
+    if args.k is None:
+        k_s = f"none ({args.k_method}, min_k={args.min_k})"
+    else:
+        k_s = str(args.k)
     print(
         f"Running {n} jobs  "
         f"({len(cases)} cases × {len(lambdas)} λ × {n_trials} trials "
-        f"× {len(methods)} methods)",
+        f"× {len(methods)} methods)  k={k_s}",
         flush=True,
     )
-    run_benchmark(cases, lambdas, n_trials, methods, args.seed, args.out_dir)
+    run_benchmark(
+        cases, lambdas, n_trials, methods, args.seed, args.out_dir, k=args.k,
+        k_method=args.k_method, min_k=args.min_k, penalty=args.k_penalty,
+    )
 
 
 if __name__ == "__main__":

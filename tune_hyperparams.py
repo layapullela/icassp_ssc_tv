@@ -1,5 +1,6 @@
 """
-Held-out hyperparameter search for OSC, the SSC-TV ADMM variants, and TKSS.
+Held-out hyperparameter search for OSC, SSC-TV-E1E21-L21-P, and TKSS.
+Other SSC-TV ADMM variants remain selectable via ``--methods``.
 
 Protocol
 --------
@@ -7,33 +8,42 @@ One hyperparameter vector per method (not per case / not per noise level).
 Validation graphs use a different RNG seed from the test benchmark so the
 selected values are not fit on the numbers we later report.
 
-Each Y is Frobenius-normalised.  SSC-TV λ_z is fixed at 1 (not searched);
+Each Y has columns scaled to unit ℓ2 norm.  SSC-TV λ_z is fixed at 1 (not searched);
 other penalties are log-uniform on [1e-5, 10].  λ_e21 is tuned pre-scale
 and multiplied by sqrt(N) at solve time.
 
 Validation design
-    cases   : every SBM test case (size, probability, and outlier sweeps).
+    cases   : all SBM test cases except large-N scalability cases (N=400, 800),
+              which are slow and contribute little extra signal at tuning time.
               Graphs are still drawn with a different RNG seed from the
               reported benchmark, so the search is not fit on the test draws.
-    λ       : {0.0, 0.10, 0.50, 1.00, 2.00}  (noiseless through high Poisson;
-              0.05 / 0.20 / 0.30 / 0.75 / 1.50 / 3.00 stay held out)
+              Includes heterogeneous-block, DC-SBM, Gaussian-noise, and
+              weak/imbalanced cases introduced in the extended benchmark.
+    λ       : {0.50}  (medium noise; σ for Gaussian-noise cases)
     trials  : 2
     seed    : 1_000_003     (benchmark test seed is 0)
     max_iter: 80            (faster; winners are re-evaluated at 200)
     search  : Optuna TPE over every method (40 trials/method)
 
 Objective (to maximize)
-    score = mean ARI + (also can look at F1 score for outlier detection, but this is disabled for now)
-          (F1 is 0 when a config never produces a finite F1)
+    score = mean_ARI + nmi_weight * mean_NMI + f1_weight * mean_F1_outlier 
+    Both ARI and NMI are in [0, 1].  By default nmi_weight=0 so the primary
+    signal is ARI; set --nmi-weight 0.5 to give NMI equal weight.
+    F1 is from the outlier-detection score on outlier cases; f1_weight=0 by default.
 
-ARI is primary so clustering quality still dominates; the F1 bonus is
-there so SSC variants are not rewarded for zeroing E.
+    k (``--k``): default ``oracle`` uses the true SBM block count.  ``--k none``
+    estimates k via ``--k-method`` (``eigengap`` or ``ncut``; default
+    eigengap with ``--min-k 2``).  OSC / SSC-TV: coefficient affinity;
+    TKSS: observation matrix Y.
 
 Usage
 -----
-    python tune_hyperparams.py                  # Optuna TPE, all methods
+    python tune_hyperparams.py                  # Optuna TPE: OSC, SSC-TV-E1E21-L21-P, TKSS
     python tune_hyperparams.py --quick          # 1 graph trial, cases 1 and 4 only
     python tune_hyperparams.py --retune OSC     # one method; merge into existing JSON
+    python tune_hyperparams.py --k none --k-method eigengap --min-k 2
+    python tune_hyperparams.py --k none --k-method ncut
+    python tune_hyperparams.py --nmi-weight 0.5 # ARI + 0.5 * NMI objective
     python benchmark_sbm.py --params results/best_hyperparams.json \\
         --out-dir results/tuned
 """
@@ -55,47 +65,69 @@ import benchmark_sbm as bench
 ROOT = Path(__file__).resolve().parent
 
 F1_WEIGHT = 0 # TODO: decide if we want this in the loss
+NMI_WEIGHT = 0.0  # TODO: set --nmi-weight > 0 to blend NMI into the objective? does this help idk
 VAL_SEED = 1_000_003
-TUNE_MAX_ITER = 80
+TUNE_MAX_ITER = 200
 N_TRIALS = 40
 N_STARTUP_TRIALS = 10
-TUNE_CASES = list(bench.CASES)
-TUNE_LAMBDAS = [0.0, 0.10, 0.50, 1.00, 2.00]
+# Exclude large-N scalability cases (N=400, 800) from default tuning: they
+# are taking too long and the params found at N≈200 seem to transfer well to larger graphs.
+_SLOW_CASES = frozenset({"16_scale_400", "17_scale_800"})
+TUNE_CASES = [c for c in bench.CASES if c not in _SLOW_CASES]
+TUNE_LAMBDAS = [0.0, 0.25, 0.5, 1.0, 2.0, 3.0]
 
-# Log-uniform Optuna ranges.  λ_z is fixed at 1 (not searched); λ_e21 is the
-# pre-√N scale.  One space per METHOD_SPECS entry in benchmark_sbm.py.
+# log-uniform Optuna ranges.  λ_z is fixed at 1 (not searched); λ_e21 is the
+# pre-sqrt(N) scale.  One space per METHOD_SPECS entry in benchmark_sbm.py.
+# γ for SSC-TV variants is floored at 1e-2 (too-small γ collapses TV).
 PARAM_RANGE = (1e-5, 10.0)
+GAMMA_RANGE = (1e-2, 10.0)
 SEARCH_SPACES = {
     "OSC": {
         "lambda1": PARAM_RANGE,
         "lambda2": PARAM_RANGE,
     },
+    "BDOSC": {
+        "lambda1": PARAM_RANGE,
+        "lambda2": PARAM_RANGE,
+        "gamma1": PARAM_RANGE,
+        "p": (1.01, 1.5),
+    },
     "SSC-TV": {
         "lambda_e": PARAM_RANGE,
-        "gamma": PARAM_RANGE,
+        "gamma": GAMMA_RANGE,
     },
     "SSC-TV-L21-P": {
         "lambda_e": PARAM_RANGE,
-        "gamma": PARAM_RANGE,
+        "gamma": GAMMA_RANGE,
     },
     "SSC-TV-L21-PQ": {
         "lambda_e": PARAM_RANGE,
-        "gamma": PARAM_RANGE,
+        "gamma": GAMMA_RANGE,
+    },
+    "SSC-TV-L21-PQ-SparseC": {
+        "lambda_e": PARAM_RANGE,
+        "lambda_c": PARAM_RANGE,
+        "gamma": GAMMA_RANGE,
+    },
+    "SSC-TV-L21-PQ-LowRankC": {
+        "lambda_e": PARAM_RANGE,
+        "lambda_c": PARAM_RANGE,
+        "gamma": GAMMA_RANGE,
     },
     "SSC-TV-E1E21": {
         "lambda_e1": PARAM_RANGE,
         "lambda_e21": PARAM_RANGE,
-        "gamma": PARAM_RANGE,
+        "gamma": GAMMA_RANGE,
     },
     "SSC-TV-E1E21-L21-P": {
         "lambda_e1": PARAM_RANGE,
         "lambda_e21": PARAM_RANGE,
-        "gamma": PARAM_RANGE,
+        "gamma": GAMMA_RANGE,
     },
     "SSC-TV-E1E21-L21-PQ": {
         "lambda_e1": PARAM_RANGE,
         "lambda_e21": PARAM_RANGE,
-        "gamma": PARAM_RANGE,
+        "gamma": GAMMA_RANGE,
     },
     "TKSS": {
         "lam": PARAM_RANGE,
@@ -113,7 +145,7 @@ def spec_by_name(name):
     raise KeyError(name)
 
 
-def build_val_graphs(cases, lambdas, n_trials, seed):
+def build_val_graphs(cases, lambdas, n_trials, seed, k="oracle"):
     graphs = []
     for case_name in cases:
         cfg = bench.CASES[case_name]
@@ -130,7 +162,7 @@ def build_val_graphs(cases, lambdas, n_trials, seed):
                     "case": case_name,
                     "lambda": lam,
                     "trial": trial,
-                    "k": cfg["k"],
+                    "k": bench.resolve_run_k(k, cfg["k"]),
                     "Y": Y,
                     "labels": labels,
                     "outlier_mask": outlier_mask,
@@ -138,23 +170,33 @@ def build_val_graphs(cases, lambdas, n_trials, seed):
     return graphs
 
 
-def eval_solver(solver, name, graphs):
-    aris, f1s = [], []
+def eval_solver(solver, name, graphs, k_method="eigengap", min_k=2, penalty=0.0):
+    aris, nmis, f1s = [], [], []
     for g in graphs:
         try:
             rec = bench.run_one(
                 g["Y"], g["labels"], g["k"], name, solver, g["outlier_mask"],
+                k_method=k_method, min_k=min_k, penalty=penalty,
             )
         except Exception:
             aris.append(float("nan"))
+            nmis.append(float("nan"))
             continue
         aris.append(rec["ari"])
+        nmis.append(rec.get("nmi", float("nan")))
         if np.isfinite(rec["f1"]):
             f1s.append(rec["f1"])
     ari = float(np.nanmean(aris)) if aris else float("nan")
+    nmi = float(np.nanmean(nmis)) if nmis else float("nan")
     f1 = float(np.mean(f1s)) if f1s else 0.0
-    score = (0.0 if not np.isfinite(ari) else ari) + F1_WEIGHT * f1
-    return ari, f1, score
+    # NaN ARI (e.g. divide-by-zero in metrics) → -1 so Optuna avoids it.
+    if not np.isfinite(ari):
+        ari = -1.0
+    nmi_term = 0.0 if not np.isfinite(nmi) else nmi
+    score = ari + NMI_WEIGHT * nmi_term + F1_WEIGHT * f1
+    if not np.isfinite(score):
+        score = -1.0
+    return ari, nmi, f1, score
 
 
 def suggest_params(trial, name):
@@ -177,7 +219,8 @@ def default_search_params(name):
     return out
 
 
-def _eval_config(name, extra, graphs, max_iter):
+def _eval_config(name, extra, graphs, max_iter, k_method="eigengap",
+                 min_k=2, penalty=0.0):
     spec = spec_by_name(name)
     kw = dict(spec["defaults"])
     if spec["kind"] != "tkss":
@@ -186,11 +229,15 @@ def _eval_config(name, extra, graphs, max_iter):
     if spec["kind"] == "ssc":
         kw["lambda_z"] = bench.LAMBDA_Z
     solver = bench.make_solver(spec, kw)
-    return eval_solver(solver, name, graphs)
+    return eval_solver(
+        solver, name, graphs,
+        k_method=k_method, min_k=min_k, penalty=penalty,
+    )  # (ari, nmi, f1, score)
 
 
 def tune_method_optuna(
     name, graphs, max_iter, n_trials, n_startup, seed, storage_path, resume,
+    k_method="eigengap", min_k=2, penalty=0.0, prior_weight=1.0,
 ):
     if name not in SEARCH_SPACES:
         raise KeyError(f"no Optuna search space for {name}")
@@ -202,6 +249,7 @@ def tune_method_optuna(
             seed=seed,
             multivariate=True,
             n_startup_trials=n_startup,
+            prior_weight=prior_weight,
         )
     db_url = f"sqlite:///{Path(storage_path).resolve()}"
     storage = optuna.storages.RDBStorage(url=db_url)
@@ -235,11 +283,17 @@ def tune_method_optuna(
 
     def objective(trial):
         extra = suggest_params(trial, name)
-        ari, f1, score = _eval_config(name, extra, graphs, max_iter)
-        trial.set_user_attr("val_ari", ari)
-        trial.set_user_attr("val_f1", f1)
+        ari, nmi, f1, score = _eval_config(
+            name, extra, graphs, max_iter,
+            k_method=k_method, min_k=min_k, penalty=penalty,
+        )
+        if not np.isfinite(ari):
+            ari = -1.0
         if not np.isfinite(score):
-            return -1.0
+            score = -1.0
+        trial.set_user_attr("val_ari", ari)
+        trial.set_user_attr("val_nmi", nmi)
+        trial.set_user_attr("val_f1", f1)
         return score
 
     def callback(study, trial):
@@ -254,12 +308,14 @@ def tune_method_optuna(
         except ValueError:
             best_s = "n/a"
         ari = trial.user_attrs.get("val_ari")
+        nmi = trial.user_attrs.get("val_nmi")
         f1 = trial.user_attrs.get("val_f1")
         ari_s = f"{ari:.3f}" if ari is not None and np.isfinite(ari) else "nan"
+        nmi_s = f"{nmi:.3f}" if nmi is not None and np.isfinite(nmi) else "nan"
         f1_s = f"{f1:.3f}" if f1 is not None and np.isfinite(f1) else "nan"
         print(
             f"  [{done}/{target}] {name}  {trial.params}  "
-            f"ARI={ari_s}  F1={f1_s}  score={score_s}  best={best_s}  "
+            f"ARI={ari_s}  NMI={nmi_s}  F1={f1_s}  score={score_s}  best={best_s}  "
             f"ETA {eta:.0f}s",
             flush=True,
         )
@@ -274,6 +330,7 @@ def tune_method_optuna(
     best = {
         "params": params,
         "val_ari": float(best_trial.user_attrs.get("val_ari", best_trial.value)),
+        "val_nmi": float(best_trial.user_attrs.get("val_nmi", float("nan"))),
         "val_f1": float(best_trial.user_attrs.get("val_f1", 0.0)),
         "score": float(best_trial.value),
         "n_trials": len(study.trials),
@@ -284,6 +341,7 @@ def tune_method_optuna(
             "method": name,
             "trial": t.number,
             "val_ari": t.user_attrs.get("val_ari", t.value),
+            "val_nmi": t.user_attrs.get("val_nmi"),
             "val_f1": t.user_attrs.get("val_f1"),
             "score": t.value,
         }
@@ -297,11 +355,11 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out-dir", type=str, default=str(ROOT / "results"))
     p.add_argument("--seed", type=int, default=VAL_SEED)
-    p.add_argument("--trials", type=int, default=2)
+    p.add_argument("--trials", type=int, default=10)
     p.add_argument("--max-iter", type=int, default=TUNE_MAX_ITER)
     p.add_argument(
         "--lambdas", type=float, nargs="+", default=list(TUNE_LAMBDAS),
-        help="Poisson rates on the tune graphs (default: 0, 0.10, 0.50, 1.00, 2.00).",
+        help="Poisson rates on the tune graphs (default: 0.50).",
     )
     p.add_argument(
         "--cases", nargs="+", default=list(TUNE_CASES),
@@ -309,7 +367,7 @@ def parse_args():
     )
     p.add_argument(
         "--methods", nargs="+",
-        default=[s["name"] for s in bench.METHOD_SPECS],
+        default=list(bench.DEFAULT_METHODS),
         choices=[s["name"] for s in bench.METHOD_SPECS],
     )
     p.add_argument(
@@ -328,6 +386,10 @@ def parse_args():
         help="Random TPE warmup trials before Bayesian proposals. Default 10.",
     )
     p.add_argument(
+        "--prior-weight", type=float, default=1.0,
+        help="TPESampler prior_weight (>1 encourages more exploration; default 1).",
+    )
+    p.add_argument(
         "--tune-seed", type=int, default=0,
         help="Optuna TPESampler seed.",
     )
@@ -341,7 +403,30 @@ def parse_args():
     )
     p.add_argument(
         "--f1-weight", type=float, default=F1_WEIGHT,
-        help="Weight on mean case-4 F1 in the selection score (default 0.25).",
+        help="Weight on mean outlier-case F1 in the selection score (default 0).",
+    )
+    p.add_argument(
+        "--nmi-weight", type=float, default=NMI_WEIGHT,
+        help="Weight on mean NMI in the selection score (default 0). "
+             "Set to 0.5 for ARI + 0.5*NMI objective.",
+    )
+    p.add_argument(
+        "--k", type=bench.parse_k_arg, default="oracle",
+        help="Cluster count: 'oracle' (default, true SBM k), 'none' (infer "
+             "via --k-method), or a positive integer.",
+    )
+    p.add_argument(
+        "--k-method", type=str, default="eigengap",
+        choices=["eigengap", "ncut"],
+        help="How to infer k when --k none (default: eigengap).",
+    )
+    p.add_argument(
+        "--min-k", type=int, default=2,
+        help="Minimum k when inferring (default 2; avoids trivial eigengap at 1).",
+    )
+    p.add_argument(
+        "--k-penalty", type=float, default=0.0,
+        help="Optional linear penalty for method=ncut (cost + penalty*k).",
     )
     p.add_argument(
         "--merge", action="store_true",
@@ -352,8 +437,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    global F1_WEIGHT
+    global F1_WEIGHT, NMI_WEIGHT
     F1_WEIGHT = args.f1_weight
+    NMI_WEIGHT = args.nmi_weight
     if args.retune:
         args.methods = list(args.retune)
         args.merge = True
@@ -376,13 +462,19 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.k is None:
+        k_s = f"none ({args.k_method}, min_k={args.min_k})"
+    else:
+        k_s = str(args.k)
     print(
         f"Building validation graphs  "
         f"({len(cases)} cases × {len(args.lambdas)} λ × {n_graph_trials} trials, "
-        f"seed={args.seed}) …",
+        f"seed={args.seed}, k={k_s}) …",
         flush=True,
     )
-    graphs = build_val_graphs(cases, args.lambdas, n_graph_trials, args.seed)
+    graphs = build_val_graphs(
+        cases, args.lambdas, n_graph_trials, args.seed, k=args.k,
+    )
     print(f"  {len(graphs)} graphs, Y shape {graphs[0]['Y'].shape}", flush=True)
 
     n_jobs = n_optuna_trials * len(args.methods) * len(graphs)
@@ -407,16 +499,20 @@ def main():
             name, graphs, args.max_iter,
             n_trials=n_optuna_trials,
             n_startup=args.n_startup_trials,
+            prior_weight=args.prior_weight,
             seed=args.tune_seed,
             storage_path=storage_path,
             resume=args.resume,
+            k_method=args.k_method,
+            min_k=args.min_k,
+            penalty=args.k_penalty,
         )
         all_rows.extend(rows)
         selected[name] = best
         print(
             f"  → best {best['params']}  "
-            f"ARI={best['val_ari']:.3f}  F1={best['val_f1']:.3f}  "
-            f"score={best['score']:.3f}",
+            f"ARI={best['val_ari']:.3f}  NMI={best['val_nmi']:.3f}  "
+            f"F1={best['val_f1']:.3f}  score={best['score']:.3f}",
             flush=True,
         )
 
@@ -429,13 +525,13 @@ def main():
                 r for r in csv.DictReader(fh) if r.get("method") not in args.methods
             ]
     combined = existing_rows + all_rows
-    skip = {"method", "val_ari", "val_f1", "score"}
+    skip = {"method", "val_ari", "val_nmi", "val_f1", "score"}
     param_keys = sorted({
         k for r in combined for k in r
         if k not in skip and r.get(k) not in ("", None)
     })
     with csv_path.open("w", newline="") as fh:
-        fields = ["method", *param_keys, "val_ari", "val_f1", "score"]
+        fields = ["method", *param_keys, "val_ari", "val_nmi", "val_f1", "score"]
         writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         for r in combined:
@@ -446,13 +542,21 @@ def main():
     elapsed = time.perf_counter() - t_start
     protocol_extra = {
         "search": "optuna",
-        "sampler": "TPESampler(multivariate=True)",
+        "sampler": (
+            f"TPESampler(multivariate=True, prior_weight={args.prior_weight})"
+        ),
         "n_optuna_trials": n_optuna_trials,
         "n_startup_trials": args.n_startup_trials,
+        "prior_weight": args.prior_weight,
         "search_spaces": {m: SEARCH_SPACES[m] for m in args.methods},
         "y_normalization": "frobenius",
         "lambda_z": bench.LAMBDA_Z,
         "lambda_e21_scale": "sqrt(N)",
+        "nmi_weight": NMI_WEIGHT,
+        "k": "none" if args.k is None else args.k,
+        "k_method": args.k_method,
+        "min_k": args.min_k,
+        "k_penalty": args.k_penalty,
     }
     if args.merge and json_path.exists():
         payload = json.loads(json_path.read_text())
@@ -474,7 +578,8 @@ def main():
                 "trials": n_graph_trials,
                 "max_iter_tune": args.max_iter,
                 "f1_weight": F1_WEIGHT,
-                "objective": "mean_ARI + f1_weight * mean_case4_F1",
+                "nmi_weight": NMI_WEIGHT,
+                "objective": "mean_ARI + nmi_weight * mean_NMI + f1_weight * mean_F1_outlier",
                 "elapsed_seconds": elapsed,
                 **protocol_extra,
             },
@@ -488,7 +593,8 @@ def main():
         info = selected[name]
         print(
             f"{name:24s}  {info['params']}  "
-            f"val ARI={info['val_ari']:.3f}  F1={info['val_f1']:.3f}",
+            f"val ARI={info['val_ari']:.3f}  NMI={info['val_nmi']:.3f}  "
+            f"F1={info['val_f1']:.3f}",
             flush=True,
         )
     print(
